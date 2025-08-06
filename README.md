@@ -3,7 +3,7 @@ Live Transcriber (Online/Offline)
 A versatile real-time transcription application for Windows that captures audio from any source (microphone or system audio/loopback) and converts it to text using your choice of powerful transcription engines.
 
 <p align="center">
-<img src="https://i.imgur.com/vHq4V9O.png" alt="Main Application Window" width="70%"/>
+<img src="https://drive.google.com/uc?id=1NFu7S5s9HIItL1fwX1HiK1EBEXE1aBUk" alt="Main Application Window" width="70%"/>
 </p>
 
 Features
@@ -35,7 +35,7 @@ Features
     Standalone Executable: No need to install Python or dependencies. Just download the release and run.
 
 <p align="center">
-<img src="https://i.imgur.com/1GkG415.png" alt="Settings Window" width="70%"/>
+<img src="https://drive.google.com/uc?id=1X3OKLpo8tq1kcPS9pnM6qQHlpnyf22J0" alt="Settings Window" width="70%"/>
 </p>
 How to Use
 
