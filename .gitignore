@@ -1,0 +1,42 @@
+# --- Speech models (downloaded on demand, far too big for git) ---------------
+# Vosk / Sherpa models and the speaker-embedding model are fetched from
+# Settings inside the app, so they never belong in the repo.
+vosk_models/
+sherpa_models/
+speaker_models/
+models/
+
+# Personal models.json overlay (models.example.json IS tracked as the template)
+models.json
+
+# --- Build output ------------------------------------------------------------
+build/
+dist/
+release/
+*.zip
+*.manifest
+
+# --- Local runtime state -----------------------------------------------------
+# config.ini is regenerated with defaults on first run and holds machine
+# specific choices (audio device names, theme, model paths).
+config.ini
+*.log
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# --- Editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+.DS_Store

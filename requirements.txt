@@ -1,0 +1,16 @@
+# Core (required)
+numpy
+sounddevice
+requests
+PyAudioWPatch           # Windows system-audio (loopback) capture + mic/system mix
+
+# Engines (install any subset - the app detects what's available)
+vosk                    # offline, streaming, live partial results
+sherpa-onnx             # offline, streaming (newer models than Vosk); also powers speaker labels
+faster-whisper          # offline, best accuracy/speed trade-off (recommended)
+useful-moonshine-onnx   # offline, new fast English model for live captions
+SpeechRecognition       # online: Google Web Speech (free, no key) + Google Cloud
+
+# Optional
+# openai-whisper        # original Whisper implementation (slower than faster-whisper)
+# google-cloud-speech   # only needed for the Google Cloud engine

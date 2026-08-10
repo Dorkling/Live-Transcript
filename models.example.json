@@ -1,0 +1,21 @@
+{
+  "_comment": "Rename this file to models.json to add models without touching code. Vosk models: alphacephei.com/vosk/models | Sherpa models: github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models | faster-whisper: any CTranslate2 repo id on huggingface.co",
+  "vosk": {
+    "german-small": {
+      "url": "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip",
+      "extracted_dir_name": "vosk-model-small-de-0.15",
+      "description": "Vosk Small German (~45MB)"
+    }
+  },
+  "sherpa": {
+    "bilingual-zh-en": {
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2",
+      "dir_name": "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+      "description": "Streaming Zipformer bilingual Chinese+English (~300MB)"
+    }
+  },
+  "faster_whisper_models": [
+    "deepdml/faster-whisper-large-v3-turbo-ct2"
+  ],
+  "moonshine_models": []
+}

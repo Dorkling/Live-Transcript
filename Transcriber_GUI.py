@@ -1,2087 +1,2518 @@
+#!/usr/bin/env python3
+"""Live Transcriber.
+
+Live speech-to-text with selectable engines:
+  * Vosk          - offline, true streaming with live partial results
+  * Whisper       - offline, via faster-whisper (recommended) or openai-whisper
+  * Google Cloud  - online, requires a credentials JSON file
+
+Extras: proper dark/light theming, window transparency, always-on-top pin and
+a caption-style overlay mode.
+
+All audio capture goes through sounddevice with a single recorder thread, so
+every engine sees the same device list and the same indices.
+"""
+
 import sys
-import subprocess
 import os
-# --- MODIFICATION START: Redirect stdout/stderr when frozen ---
-import io # Needed for redirection target in some cases
-
-# Redirect stdout and stderr to prevent crashes in windowed mode when libraries print
-if getattr(sys, 'frozen', False): # Checks if running as a PyInstaller bundle
-    print("Running frozen - Redirecting stdout/stderr...") # Log redirection attempt (won't be visible in windowed mode)
-    try:
-        # Option 1: Redirect to os.devnull (discard output)
-        sys.stdout = open(os.devnull, 'w')
-        sys.stderr = open(os.devnull, 'w')
-
-        # Option 2: Redirect to a log file (for debugging) - Uncomment if needed
-        # log_file_path = os.path.join(os.path.dirname(sys.executable), 'app_output.log')
-        # print(f"Redirecting output to: {log_file_path}") # This print will go to the original stdout before redirection
-        # sys.stdout = open(log_file_path, 'a')
-        # sys.stderr = sys.stdout # Redirect stderr to the same file
-        # print("--- stdout/stderr redirected ---") # This print will go to the file
-
-    except Exception as e:
-        # If redirection fails, we can't do much, but try to avoid crashing here
-        print(f"Failed to redirect stdout/stderr: {e}") # This might fail too if print is broken
-        pass # Continue execution
-
-# --- MODIFICATION END ---
-
+import json
+import queue
+import threading
+import time
+import zipfile
+import tarfile
+import glob
 import importlib.util
-import queue # For inter-thread data buffering (FIFO) - Used for GUI updates and Vosk audio
-import json # Data structure for Vosk results
-import threading # For concurrent execution tasks
-import time # For timekeeping and delays
-from datetime import datetime # For timestamping events
-import tkinter as tk # UI toolkit base
-from tkinter import ttk, scrolledtext, messagebox, font, filedialog # UI widgets and utilities, added filedialog
-import configparser # For managing persistent configuration parameters
-import zipfile # For extracting downloaded model archives
-import requests # For downloading the model file
+import configparser
+from collections import deque
+from datetime import datetime
 
-# --- Theme Colors ---
-LIGHT_THEME = {
-    "bg": "#F0F0F0",        # Default window background
-    "fg": "#000000",        # Default text color
-    "entry_bg": "#FFFFFF",
-    "entry_fg": "#000000",
-    "text_bg": "#FFFFFF",
-    "text_fg": "#000000",
-    "button_fg": "#000000", # Black text on buttons
-    "status_bg": "#F0F0F0",
-    "status_fg": "#000000",
-    "frame_bg": "#F0F0F0",
-    "frame_fg": "#000000", # LabelFrame title color
-    "disabled_fg": "#A0A0A0",
-}
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 
-# Consistent DARK_THEME (Dark backgrounds, Light Text where possible, Black text on problematic widgets for contrast)
-DARK_THEME = {
-    "bg": "#2E2E2E",       # Dark background for main window/frames
-    "fg": "#EAEAEA",       # Light text for labels etc. on dark bg
-    "entry_bg": "#3C3C3C", # Try dark entry bg
-    "entry_fg": "#000000", # Black text in entry/combobox for contrast
-    "text_bg": "#1E1E1E",  # Very dark background for transcript area
-    "text_fg": "#EAEAEA",  # Light text in transcript area
-    "button_fg": "#000000", # Black text on buttons for contrast
-    "status_bg": "#2E2E2E", # Dark background for status bar
-    "status_fg": "#EAEAEA", # Light text on status bar
-    "frame_bg": "#2E2E2E",  # Dark frame background
-    "frame_fg": "#EAEAEA",  # Light text for LabelFrame titles
-    "disabled_fg": "#777777", # Gray for disabled button text
-}
+# In a windowed PyInstaller build there is no console; stray prints from
+# libraries would raise. Send them to a log file next to the exe instead.
+if getattr(sys, "frozen", False):
+    try:
+        _frozen_log = open(
+            os.path.join(os.path.dirname(sys.executable), "app_errors.log"),
+            "a", buffering=1, encoding="utf-8", errors="replace")
+        sys.stdout = _frozen_log
+        sys.stderr = _frozen_log
+    except Exception:
+        pass
 
 
-# --- System State & Dependency Management ---
-# Define required external library packages (dependencies)
-# Added sounddevice back and soundfile
-DEPENDENCIES = ["SpeechRecognition", "google-cloud-speech", "vosk", "numpy", "requests", "pyaudio", "openai-whisper", "sounddevice", "soundfile"]
-# Define the local directory for storing these dependencies (akin to a local environment)
-LIBS_DIR = "libs"
-# Define standard location for automatically downloaded Vosk models
-MODEL_BASE_DIR = "vosk_models" # Subdirectory for models relative to the script/exe
+def _fatal_startup_error(message):
+    """Show a startup error even if the main GUI never got built."""
+    print(f"[FATAL] {message}")
+    try:
+        hidden = tk.Tk()
+        hidden.withdraw()
+        messagebox.showerror("Live Transcriber - startup error", message)
+        hidden.destroy()
+    except Exception:
+        pass
+    sys.exit(1)
 
-# --- Vosk Model Definitions ---
-# Dictionary containing info for downloadable models
-# Keys: User-friendly identifier (used in config and GUI)
-# Values: Dict with 'url', 'extracted_dir_name', and 'description' including rough resource estimates
+
+# --- Required dependencies -------------------------------------------------
+try:
+    import numpy as np
+except ImportError:
+    _fatal_startup_error("The 'numpy' package is required.\n\nInstall it with:\n    pip install numpy")
+
+try:
+    import sounddevice as sd
+except Exception as e:
+    _fatal_startup_error(f"The 'sounddevice' package (and PortAudio) is required.\n\nInstall it with:\n    pip install sounddevice\n\nDetails: {e}")
+
+# --- Optional dependencies (engines degrade gracefully) ---------------------
+try:
+    import vosk
+    HAVE_VOSK = True
+except Exception:
+    vosk = None
+    HAVE_VOSK = False
+
+try:
+    from faster_whisper import WhisperModel as FasterWhisperModel
+    HAVE_FASTER_WHISPER = True
+except Exception:
+    FasterWhisperModel = None
+    HAVE_FASTER_WHISPER = False
+
+try:
+    import whisper as openai_whisper
+    HAVE_OPENAI_WHISPER = True
+except Exception:
+    openai_whisper = None
+    HAVE_OPENAI_WHISPER = False
+
+try:
+    import speech_recognition as sr_lib
+    HAVE_SR = True
+except Exception:
+    sr_lib = None
+    HAVE_SR = False
+
+try:
+    import sherpa_onnx
+    HAVE_SHERPA = True
+except Exception:
+    sherpa_onnx = None
+    HAVE_SHERPA = False
+
+# WASAPI loopback (capture what the PC is playing) - Windows only.
+try:
+    import pyaudiowpatch as pyaudio_patch
+    HAVE_LOOPBACK = sys.platform == "win32"
+except Exception:
+    pyaudio_patch = None
+    HAVE_LOOPBACK = False
+
+# Moonshine pulls in heavy imports; detect it cheaply and import on first use.
+HAVE_MOONSHINE = importlib.util.find_spec("moonshine_onnx") is not None
+
+try:
+    import requests
+    HAVE_REQUESTS = True
+except Exception:
+    requests = None
+    HAVE_REQUESTS = False
+
+
+# --- Constants ---------------------------------------------------------------
+APP_TITLE = "Live Transcriber"
+CONFIG_FILE = "config.ini"
+MODEL_BASE_DIR = "vosk_models"
+
 MODEL_INFO = {
     "small": {
         "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
         "extracted_dir_name": "vosk-model-small-en-us-0.15",
-        "description": "Vosk Small US English (~45MB) - Fast, Lower Accuracy (CPU: Low, RAM: <0.5GB)"
+        "description": "Small US English (~45MB) - fast, lower accuracy",
     },
     "large": {
         "url": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
         "extracted_dir_name": "vosk-model-en-us-0.22",
-        "description": "Vosk Large US English (~1.8GB) - Slower, Better Accuracy (CPU: High, RAM: 2-4GB+)"
+        "description": "Large US English (~1.8GB) - slower, better accuracy",
     },
     "gigaspeech": {
         "url": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip",
         "extracted_dir_name": "vosk-model-en-us-0.42-gigaspeech",
-        "description": "Vosk Gigaspeech US English (~2.6GB) - Slowest, Best Accuracy (CPU: Very High, RAM: 4-6GB+)"
+        "description": "Gigaspeech US English (~2.6GB) - slowest, best accuracy",
     },
-    # Add other models here if desired
 }
-DEFAULT_VOSK_MODEL_TYPE = "small" # Default Vosk model type if config is missing
+DEFAULT_VOSK_MODEL_TYPE = "small"
 
-# --- Whisper Model Definitions ---
-WHISPER_MODEL_SIZES = ["tiny", "base", "small", "medium", "large"] # Standard Whisper sizes
-DEFAULT_WHISPER_SIZE = "base" # Default Whisper size
-
-def check_pip_availability():
-    """Checks if pip is available for the current Python interpreter."""
-    # This function is primarily for running the script directly with Python,
-    # less critical when bundled with PyInstaller but kept for completeness.
-    print("Verifying package manager (pip) availability...")
-    try:
-        # Use 'pip --version' as a simple check
-        result = subprocess.run([sys.executable, "-m", "pip", "--version"], check=True, capture_output=True, text=True)
-        print(f"  [OK] Found pip: {result.stdout.strip()}")
-        return True
-    except FileNotFoundError:
-        # This means sys.executable (python) was not found - very unlikely but possible
-        print(f"  [System Error] Python executable not found at '{sys.executable}'. Cannot proceed.")
-        return False
-    except subprocess.CalledProcessError as e:
-        # This means 'python -m pip' failed, likely because pip module isn't installed
-        print(f"  [System Error] 'pip' module not found for Python at '{sys.executable}'.")
-        print("      pip is required to manage dependencies.")
-        print("\n      --- ACTION REQUIRED ---")
-        print("      1. Try running: python -m ensurepip --upgrade")
-        print("      2. If that fails, consider reinstalling or upgrading your Python distribution from python.org,")
-        print("         ensuring the option to install pip is selected.")
-        print("      -----------------------\n")
-        return False
-    except Exception as e:
-        # Catch any other unexpected errors during the check
-        print(f"  [System Error] Unexpected error while checking for pip: {e}")
-        return False
-
-def install_dependencies():
-    """Verifies presence of required libraries, installs locally if absent, checks for updates if present."""
-    # NOTE: This function is typically NOT called when running the bundled PyInstaller application,
-    # as PyInstaller includes the dependencies found during the build process.
-    # It's primarily for running the .py script directly.
-    print("Initializing system: Verifying external library states...")
-
-    # --- Check for pip first ---
-    if not check_pip_availability():
-        return False # Halt if pip is not usable
-
-    # --- Proceed with dependency installation/update ---
-    libs_path = os.path.abspath(LIBS_DIR) # Absolute path to local library store
-    os.makedirs(libs_path, exist_ok=True) # Ensure the directory exists
-
-    # Prepend the local library path to Python's module search path
-    if libs_path not in sys.path:
-        sys.path.insert(0, libs_path)
-        print(f"System Path Modification: Prioritizing local library path '{libs_path}'.")
-
-    all_requirements_met = True # Assume system state is initially valid
-    # Base command for invoking the pip package manager, targeting the local directory
-    pip_command_base = [
-        sys.executable, "-m", "pip", "install",
-        "--target", libs_path, # Installation locus
-        "--no-user", # Isolate from user-specific site-packages
-        "--disable-pip-version-check", # Suppress verbose version checks
-        "--no-cache-dir" # Avoid using pip cache (can be removed for potential speedup)
-    ]
-
-    for package in DEPENDENCIES:
-        # Special handling for pyaudio on some systems might be needed, but try pip first
-        install_needed = False # Reset flag for each package
-        try:
-            # Attempt to locate the module specification using Python's import mechanics
-            # Need to map package names to actual module names for checking
-            module_name = package
-            if package == 'google-cloud-speech': module_name = 'google.cloud.speech'
-            elif package == 'SpeechRecognition': module_name = 'speech_recognition'
-            elif package == 'openai-whisper': module_name = 'whisper'
-            elif package == 'pyaudio': module_name = '_portaudio' # PyAudio check is tricky, check internal? Or just try install. Let's just try install.
-            elif package == 'sounddevice': module_name = 'sounddevice' # Added sounddevice check
-            elif package == 'soundfile': module_name = 'soundfile' # Added soundfile check
-
-            spec = None
-            # Skip find_spec for pyaudio and soundfile (libsndfile dependency makes it tricky)
-            if package not in ['pyaudio', 'soundfile']:
-                spec = importlib.util.find_spec(module_name)
-                if spec is None: raise ImportError
-
-            # --- Package Found (or skipping check) - Check for Updates ---
-            print(f"  [State OK] Found {package} (or skipping check). Probing for potential updates...")
-            try:
-                # Construct pip command to attempt an upgrade
-                command = pip_command_base + ["--upgrade", package]
-                # Execute pip, capturing output to avoid excessive console noise
-                result = subprocess.run(command, check=False, capture_output=True, text=True)
-                if result.returncode != 0:
-                    # Log deviation from expected zero return code (potential transient error)
-                    print(f"      [System Warning] pip upgrade probe for '{package}' non-zero exit code ({result.returncode}):")
-                    print(f"      PIP Stderr:\n{result.stderr}")
-                    # System continues, assuming existing package is functional
-            except Exception as e:
-                 # Log failure during the update probe itself
-                 print(f"      [System Warning] Update probe failed for '{package}': {e}")
-                 # System continues, assuming existing package is functional
-
-        except ImportError:
-            # --- Package Not Found - Installation Required ---
-            print(f"  [State Error] '{package}' not found. Initiating local installation into '{LIBS_DIR}'...")
-            install_needed = True
-            try:
-                # Construct pip command for initial installation
-                command = pip_command_base + [package]
-                print(f"      Executing: {' '.join(command)}")
-                # Execute pip, demanding success (check=True raises error on failure)
-                subprocess.run(command, check=True, capture_output=True, text=True)
-                print(f"      Installation successful: '{package}' -> '{LIBS_DIR}'.")
-                # Force Python to recognize the newly installed package
-                importlib.invalidate_caches()
-                # Re-check import after installation
-                if package not in ['pyaudio', 'soundfile']: # Cannot easily check these imports this way
-                    if importlib.util.find_spec(module_name) is None:
-                        print(f"      [System Error] Installation reported success, but still cannot import '{module_name}'.")
-                        all_requirements_met = False
-            except subprocess.CalledProcessError as e:
-                # Pip command execution failed
-                print(f"      [System Error] Failed to install '{package}'. Exit Code: {e.returncode}")
-                print(f"      PIP Stderr:\n{e.stderr}")
-                print("\n      --- ACTION REQUIRED ---")
-                print("      Installation failed. Possible reasons:")
-                print("        - Network connection issue (check internet access).")
-                print(f"       - Package requires system libraries or build tools (e.g., C++ compiler, PortAudio for PyAudio/sounddevice, libsndfile for soundfile, ffmpeg for Whisper).")
-                print("        - Insufficient permissions to write to the 'libs' directory.")
-                print("      Check the error message above from pip for specific details.")
-                print(f"      Try installing manually: {' '.join(pip_command_base + [package])}")
-                print("      -----------------------\n")
-                all_requirements_met = False
-            except FileNotFoundError:
-                # Should have been caught by check_pip_availability, but handle defensively
-                print(f"      [System Error] Failed to install '{package}'. 'pip' command unavailable.")
-                all_requirements_met = False
-            except Exception as e:
-                # Catch-all for other unexpected installation failures
-                print(f"      [System Error] Unexpected failure during installation of '{package}': {e}")
-                all_requirements_met = False
-
-    if all_requirements_met:
-        print("Dependency state verification complete.")
-    else:
-        print("Dependency state verification finished with errors.")
-
-    return all_requirements_met # Report overall success/failure status
-
-# --- Execute Dependency Check at Script Initialization ---
-# This now includes the pip check internally
-
-# --- THIS BLOCK IS COMMENTED OUT FOR PYINSTALLER ---
-# The check/install logic is generally not needed/desired in the bundled app,
-# as PyInstaller includes dependencies found during the build.
-# If running the .py script directly, uncomment this block.
-# if not install_dependencies():
-#     print("\nSystem HALT: Critical dependency or pip error prevents execution.")
-#     # Attempt to display a GUI error if Tkinter is available
-#     try:
-#         tk_spec = importlib.util.find_spec("tkinter")
-#         if tk_spec:
-#             # Only import if available to avoid further errors
-#             import tkinter as tk
-#             from tkinter import messagebox
-#             root = tk.Tk()
-#             root.withdraw() # Suppress the empty root window
-#             messagebox.showerror("Initialization Error", "Failed to initialize required libraries or pip.\nConsult console log for details and required actions.")
-#             root.destroy()
-#         else:
-#              print("(Underlying Tkinter subsystem unavailable for GUI error message)")
-#     except Exception as e:
-#         print(f"(Exception during Tkinter error reporting: {e})")
-#     sys.exit(1) # Terminate script execution
-# --- END OF BLOCK COMMENTED OUT FOR PYINSTALLER ---
-
-
-# --- Import Verified Dependencies ---
-# These imports rely on the successful execution of install_dependencies() OR
-# on the libraries being bundled correctly by PyInstaller.
-try:
-    import speech_recognition as sr # Use SpeechRecognition for audio input and API wrapping
-    import sounddevice as sd # Audio signal acquisition interface - Re-added for Vosk
-    import vosk # Still needed for offline engine
-    import numpy # Often needed by audio libraries
-    import requests # For HTTP requests (downloading model)
-    import whisper # Needed for recognize_whisper
-    import soundfile as sf # Explicitly import soundfile (though not directly used here, ensures it's found)
-    # google-cloud-speech is imported implicitly by SpeechRecognition when needed
-    # pyaudio is imported implicitly by SpeechRecognition
-except ImportError as e:
-     # This indicates a failure despite the earlier check, a critical state
-     print(f"\n[FATAL SYSTEM ERROR] Failed to import essential library: {e}")
-     print("If running bundled app: This might indicate a PyInstaller bundling issue or missing system dependency (like PortAudio for PyAudio/sounddevice, libsndfile for soundfile, or ffmpeg for Whisper).")
-     print("If running .py script: Ensure dependencies were installed correctly (check console).")
-     # Attempt GUI error message
-     try:
-        tk_spec = importlib.util.find_spec("tkinter")
-        if tk_spec:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror("Import Error", f"Failed to import required library: {e}.\nConsult console log.")
-            root.destroy()
-        else:
-            print("(Tkinter subsystem unavailable for GUI error message)")
-     except Exception as e_gui:
-        print(f"(Exception during Tkinter error reporting: {e_gui})")
-     sys.exit(1)
-
-
-# --- Configuration Parameter Handling ---
-CONFIG_FILE = "config.ini" # File for persistent parameter storage
-config = configparser.ConfigParser() # Instantiate configuration parser
-
-# Define default parameter values (system defaults)
-# Added Engine section, Whisper section
-defaults = {
-    'Paths': {'custom_model_path': ''}, # User can optionally specify an external Vosk model path here
-    'Models': {'preferred_vosk_model_type': DEFAULT_VOSK_MODEL_TYPE, 'model_directory': MODEL_BASE_DIR},
-    'Whisper': {'model_size': DEFAULT_WHISPER_SIZE}, # Added Whisper config
-    'Engine': {'type': 'vosk', 'google_cloud_credentials_json': ''}, # Added engine config
-    # MODIFICATION: Changed input_device_name to audio_source_name for clarity
-    'Audio': {'audio_source_name': '', 'log_file': 'live_transcription.log'},
-    'Settings': {'enable_logging': 'True', 'theme': 'light'} # Added theme default
+SHERPA_BASE_DIR = "sherpa_models"
+SHERPA_MODELS = {
+    "small-en": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2",
+        "dir_name": "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
+        "description": "Streaming Zipformer EN small (~90MB) - fast, light on CPU",
+    },
+    "full-en": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+        "dir_name": "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        "description": "Streaming Zipformer EN full (~600MB) - best streaming accuracy",
+    },
 }
+DEFAULT_SHERPA_MODEL = "small-en"
+
+MOONSHINE_MODELS = ["moonshine/tiny", "moonshine/base"]
+DEFAULT_MOONSHINE_MODEL = "moonshine/base"
+
+SPEAKER_MODEL_DIR = "speaker_models"
+SPEAKER_MODEL_FILE = "wespeaker_en_voxceleb_CAM++.onnx"
+SPEAKER_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                     "speaker-recongition-models/" + SPEAKER_MODEL_FILE)
+
+FASTER_WHISPER_SIZES = [
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "distil-small.en", "medium", "medium.en", "distil-medium.en",
+    "large-v2", "large-v3", "large-v3-turbo", "distil-large-v3",
+]
+OPENAI_WHISPER_SIZES = [
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large", "large-v3", "turbo",
+]
+DEFAULT_WHISPER_SIZE = "base"
+WHISPER_DEVICES = ["auto", "cpu", "cuda"]
+WHISPER_COMPUTE_TYPES = ["auto", "int8", "int8_float16", "float16", "float32"]
+
+# Engine metadata lives in the ENGINES registry further down; ENGINE_LABELS
+# is derived from it.
+
+# --- Theme palettes ----------------------------------------------------------
+LIGHT = {
+    "bg": "#f3f4f6", "surface": "#ffffff", "control": "#e3e5ea",
+    "control_hover": "#d4d7dd", "fg": "#1b1d23", "muted": "#6b7280",
+    "border": "#c6c9d0", "accent": "#2563eb", "accent_fg": "#ffffff",
+    "accent_hover": "#1d4ed8", "text_bg": "#ffffff", "text_fg": "#1b1d23",
+    "danger": "#c62828", "sel_bg": "#cfe1ff",
+    "speakers": ["#2563eb", "#1f8a4d", "#b97c14", "#a23bb0", "#0f8c8c", "#cc5a2a"],
+}
+DARK = {
+    "bg": "#1e1f24", "surface": "#26272e", "control": "#33353d",
+    "control_hover": "#3f424c", "fg": "#e7e8ea", "muted": "#9b9da6",
+    "border": "#3c3e47", "accent": "#4f8ef7", "accent_fg": "#ffffff",
+    "accent_hover": "#6da2f8", "text_bg": "#16171b", "text_fg": "#e7e8ea",
+    "danger": "#ef6363", "sel_bg": "#314a73",
+    "speakers": ["#4f8ef7", "#37b26c", "#e0a23c", "#d779e0", "#4fc3c3", "#ef8b63"],
+}
+
+# --- Globals -----------------------------------------------------------------
+config = configparser.ConfigParser()
+gui_queue = queue.Queue()
+_model_cache = {}
+
+DEFAULTS = {
+    "Engine": {"type": "vosk", "google_cloud_credentials_json": ""},
+    "Models": {"preferred_vosk_model_type": DEFAULT_VOSK_MODEL_TYPE,
+               "model_directory": MODEL_BASE_DIR},
+    "Paths": {"custom_model_path": ""},
+    "Whisper": {"backend": "faster-whisper", "model_size": DEFAULT_WHISPER_SIZE,
+                "device": "auto", "compute_type": "auto",
+                "language": "auto", "vad_filter": "True"},
+    "Sherpa": {"model": DEFAULT_SHERPA_MODEL, "custom_model_dir": ""},
+    "Moonshine": {"model": DEFAULT_MOONSHINE_MODEL},
+    "GoogleWeb": {"language": "en-US"},
+    "Speakers": {"enabled": "True", "similarity_threshold": "0.45",
+                 "max_speakers": "8"},
+    "Audio": {"audio_source_name": "", "mix_source_name": "",
+              "log_file": "live_transcription.log",
+              "pause_threshold": "0.7", "max_phrase_sec": "12.0",
+              "energy_threshold": "auto"},
+    "Settings": {"enable_logging": "True", "theme": "dark",
+                 "opacity": "100", "overlay_opacity": "85",
+                 "always_on_top": "False", "font_size": "11"},
+}
+
+
+def get_base_path():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 def load_config():
-    """Loads parameters from CONFIG_FILE or establishes default state."""
-    global config
-    # Determine base path (directory containing the script or executable)
-    base_path = get_base_path()
-    config_path = os.path.join(base_path, CONFIG_FILE)
-    print(f"Using configuration file path: {config_path}")
-
-
-    if not os.path.exists(config_path):
-        print(f"Configuration state file {CONFIG_FILE} not found; establishing default state.")
-        config.read_dict(defaults)
+    path = os.path.join(get_base_path(), CONFIG_FILE)
+    config.read_dict(DEFAULTS)
+    if os.path.exists(path):
         try:
-            with open(config_path, 'w') as configfile:
-                config.write(configfile)
-            print(f"Default configuration saved to {config_path}.")
-        except IOError as e:
-            print(f"Error persisting default state to {config_path}: {e}")
-            # Operate using in-memory defaults if file persistence fails
-            config.read_dict(defaults)
-            return False # Indicate config needs setup
-    else:
-        print(f"Loading operational parameters from {config_path}")
-        config.read(config_path)
-        # Ensure configuration integrity by merging defaults for missing parameters
-        needs_update = False
-        for section, options in defaults.items():
-            if not config.has_section(section):
-                config.add_section(section)
-                needs_update = True
-            for option, value in options.items():
-                # Only add default if option is truly missing
-                if not config.has_option(section, option):
-                    config.set(section, option, value)
-                    needs_update = True
-        # MODIFICATION: Rename old config option if present
-        if config.has_option('Audio', 'input_device_name') and not config.has_option('Audio', 'audio_source_name'):
-            print("Migrating old config option 'input_device_name' to 'audio_source_name'.")
-            config.set('Audio', 'audio_source_name', config.get('Audio', 'input_device_name'))
-            config.remove_option('Audio', 'input_device_name')
-            needs_update = True
-
-        if needs_update:
-            try:
-                with open(config_path, 'w') as configfile:
-                    config.write(configfile)
-                print("Updated parameter file with default values for missing options.")
-            except IOError as e:
-                print(f"Error updating parameter file {config_path}: {e}")
-
-    # --- Config Validation ---
-    preferred_vosk_type = config.get('Models', 'preferred_vosk_model_type', fallback=DEFAULT_VOSK_MODEL_TYPE)
-    custom_path = config.get('Paths', 'custom_model_path', fallback='')
-    engine_type = config.get('Engine', 'type', fallback='vosk')
-    google_creds = config.get('Engine', 'google_cloud_credentials_json', fallback='')
-    whisper_size = config.get('Whisper', 'model_size', fallback=DEFAULT_WHISPER_SIZE)
-
-    # Validate Vosk model settings if Vosk engine is selected
-    if engine_type == 'vosk':
-        if preferred_vosk_type == 'custom' and not custom_path:
-             print("\n[Configuration Warning] Vosk engine selected with type 'custom' but no path is set.")
-             print("Please use the Settings panel to specify a valid 'Custom Model Path'.\n")
-        elif preferred_vosk_type not in MODEL_INFO and preferred_vosk_type != 'custom':
-            print(f"\n[Configuration Warning] Invalid 'preferred_vosk_model_type' ('{preferred_vosk_type}') in config.ini.")
-            print(f"Falling back to default '{DEFAULT_VOSK_MODEL_TYPE}'. Consider setting via Settings panel.\n")
-            config.set('Models', 'preferred_vosk_model_type', DEFAULT_VOSK_MODEL_TYPE) # Correct invalid value
-
-    # Validate Google Cloud settings if selected
-    elif engine_type == 'google_cloud':
-        if not google_creds:
-            print("\n[Configuration Warning] Google Cloud engine selected but no credentials path is set.")
-            print("Please use the Settings panel to specify the path to your Google Cloud JSON key file.\n")
-
-    # Validate Whisper settings if selected
-    elif engine_type == 'whisper':
-         if whisper_size not in WHISPER_MODEL_SIZES:
-              print(f"\n[Configuration Warning] Invalid Whisper 'model_size' ('{whisper_size}') in config.ini.")
-              print(f"Falling back to default '{DEFAULT_WHISPER_SIZE}'. Consider setting via Settings panel.\n")
-              config.set('Whisper', 'model_size', DEFAULT_WHISPER_SIZE) # Correct invalid value
+            config.read(path, encoding="utf-8")
+        except Exception as e:
+            print(f"Could not parse {path}: {e} - using defaults.")
+    # Merge in any options added since the file was written.
+    for section, options in DEFAULTS.items():
+        if not config.has_section(section):
+            config.add_section(section)
+        for option, value in options.items():
+            if not config.has_option(section, option):
+                config.set(section, option, value)
+    # Migrate the pre-rename audio key from very old configs.
+    if config.has_option("Audio", "input_device_name") and not config.get("Audio", "audio_source_name", fallback=""):
+        config.set("Audio", "audio_source_name", config.get("Audio", "input_device_name"))
+        config.remove_option("Audio", "input_device_name")
+    save_config()
+    load_model_catalog()
 
 
-    return True # Indicate configuration loaded
+def load_model_catalog():
+    """Merge a models.json file (next to the app) into the built-in catalogs.
+
+    Lets new models be added without touching code. Recognised keys:
+      "vosk":   {key: {"url", "extracted_dir_name", "description"}, ...}
+      "sherpa": {key: {"url", "dir_name", "description"}, ...}
+      "faster_whisper_models": ["name-or-hf-repo-id", ...]
+      "moonshine_models": ["moonshine/...", ...]
+    See models.example.json for a template.
+    """
+    path = os.path.join(get_base_path(), "models.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, info in (data.get("vosk") or {}).items():
+            if {"url", "extracted_dir_name", "description"} <= set(info):
+                MODEL_INFO[key] = info
+        for key, info in (data.get("sherpa") or {}).items():
+            if {"url", "dir_name", "description"} <= set(info):
+                SHERPA_MODELS[key] = info
+        for name in data.get("faster_whisper_models") or []:
+            if name not in FASTER_WHISPER_SIZES:
+                FASTER_WHISPER_SIZES.append(name)
+        for name in data.get("moonshine_models") or []:
+            if name not in MOONSHINE_MODELS:
+                MOONSHINE_MODELS.append(name)
+        print(f"Loaded extra models from {path}")
+    except Exception as e:
+        print(f"Could not load models.json: {e}")
+
 
 def save_config():
-    """Saves the current configuration state to CONFIG_FILE."""
-    global config
-    # Determine base path (directory containing the script or executable)
-    base_path = get_base_path()
-    config_path = os.path.join(base_path, CONFIG_FILE)
-
+    path = os.path.join(get_base_path(), CONFIG_FILE)
     try:
-        with open(config_path, 'w') as configfile:
-            config.write(configfile)
-        print(f"Configuration saved to {config_path}")
+        with open(path, "w", encoding="utf-8") as f:
+            config.write(f)
         return True
-    except IOError as e:
-        print(f"Error saving configuration to {config_path}: {e}")
-        # Ensure messagebox has a parent if called from settings window context
-        # Use root as fallback parent
-        parent_window = root
-        if 'app' in globals() and app and app.settings_window and app.settings_window.winfo_exists():
-             parent_window = app.settings_window
-        messagebox.showerror("Config Error", f"Could not save settings to {CONFIG_FILE}:\n{e}", parent=parent_window)
+    except OSError as e:
+        print(f"Error saving config to {path}: {e}")
         return False
 
 
-# --- Vosk Model Download and Management ---
-def get_base_path():
-    """Gets the base path for the application (script dir or executable dir)."""
-    if getattr(sys, 'frozen', False):
-        # If running as a bundled app (PyInstaller)
-        return os.path.dirname(sys.executable)
-    else:
-        # If running as a script
-        return os.path.dirname(os.path.abspath(__file__))
-
-def download_and_extract_model(model_key, settings_window=None):
-    """Downloads and extracts the specified Vosk model zip file."""
-    if model_key not in MODEL_INFO:
-        err_msg = f"Unknown model key '{model_key}' specified for download."
-        print(f"[ERROR] {err_msg}")
-        if settings_window: messagebox.showerror("Download Error", err_msg, parent=settings_window)
-        return False
-
-    model_details = MODEL_INFO[model_key]
-    url = model_details['url']
-    expected_model_dir_name = model_details['extracted_dir_name']
-    description = model_details['description']
-
-    base_app_path = get_base_path()
-    target_base_dir = os.path.join(base_app_path, config.get('Models', 'model_directory', fallback=MODEL_BASE_DIR))
-    model_zip_path = os.path.join(target_base_dir, f"vosk_model_{model_key}.zip") # Unique zip name per model
-    final_model_path = os.path.join(target_base_dir, expected_model_dir_name)
-
-    print(f"Attempting to download model [{description}]...")
-    print(f"URL: {url}")
-    print(f"Target Directory: {target_base_dir}")
-    # Update GUI status via queue if called from worker, or directly if called from settings
-    status_msg = f"Downloading model: {description}... Please wait."
-    if threading.current_thread() is not threading.main_thread():
-        # This function should primarily be called from the GUI thread (Settings) now
-        # gui_queue.put(("status", status_msg)) # Avoid queue if possible
-        if app: app.status_var.set(status_msg); app.root.update_idletasks()
-    elif app: # Update status bar directly if called from GUI thread (Settings)
-         app.status_var.set(status_msg)
-         app.root.update_idletasks()
+# --- Audio helpers -----------------------------------------------------------
+MIX_SOURCE_LABEL = "\U0001F399+\U0001F50A Mic + System audio (default devices)"
+NO_MIX_LABEL = "(nothing)"
 
 
+def refresh_portaudio():
+    """Re-initialize PortAudio so devices added/removed since startup appear.
+
+    Device indices are assigned when PortAudio initializes; GoXLR-style
+    virtual devices renumber everything when their utility restarts.
+    """
     try:
-        os.makedirs(target_base_dir, exist_ok=True) # Ensure target directory exists
-
-        # Download using requests with streaming for large files
-        with requests.get(url, stream=True, timeout=120) as r: # Increased timeout further
-            r.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-            total_size = int(r.headers.get('content-length', 0))
-            downloaded_size = 0
-            chunk_size = 8192 # Process in 8KB chunks
-            last_update_time = time.time()
-
-            print(f"Downloading to {model_zip_path} ({total_size / (1024*1024):.1f} MB)...")
-            with open(model_zip_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk: # filter out keep-alive new chunks
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        # Update progress roughly every second or so to avoid spamming console/GUI queue
-                        current_time = time.time()
-                        if current_time - last_update_time > 0.5 or downloaded_size == total_size:
-                            progress = (downloaded_size / total_size) * 100 if total_size > 0 else 0
-                            progress_mb = downloaded_size / (1024*1024)
-                            total_mb = total_size / (1024*1024)
-                            print(f"  Progress: {progress_mb:.1f} / {total_mb:.1f} MB ({progress:.0f}%)", end='\r')
-                            # Send progress to GUI status bar
-                            status_update = f"Downloading model: {progress:.0f}% ({progress_mb:.1f}MB)"
-                            if threading.current_thread() is not threading.main_thread():
-                                # gui_queue.put(("status", status_update))
-                                if app: app.status_var.set(status_update); app.root.update_idletasks()
-                            elif app: # Update status bar directly
-                                 app.status_var.set(status_update)
-                                 app.root.update_idletasks() # Force GUI update
-                            last_update_time = current_time
-
-
-        print("\nDownload complete. Extracting archive...")
-        status_msg = "Extracting downloaded model..."
-        if threading.current_thread() is not threading.main_thread(): gui_queue.put(("status", status_msg))
-        elif app: app.status_var.set(status_msg); app.root.update_idletasks()
-
-
-        # Extract the zip file
-        with zipfile.ZipFile(model_zip_path, 'r') as zip_ref:
-            zip_ref.extractall(target_base_dir)
-        print(f"Extraction complete. Model placed in: {target_base_dir}")
-
-        # Verify expected directory exists after extraction
-        if not os.path.exists(final_model_path):
-             err_msg = f"Expected model directory '{final_model_path}' not found after extraction!"
-             print(f"[ERROR] {err_msg}")
-             # Try to list contents to help debug
-             try:
-                 extracted_items = os.listdir(target_base_dir)
-                 print(f"      Contents of '{target_base_dir}': {extracted_items}")
-             except Exception: pass
-             if settings_window: messagebox.showerror("Extraction Error", err_msg, parent=settings_window)
-             return False # Indicate failure
-
-    except requests.exceptions.RequestException as e:
-        err_msg = f"Model download failed: {e}"
-        print(f"\n[ERROR] {err_msg}")
-        if threading.current_thread() is not threading.main_thread(): gui_queue.put(("error", err_msg))
-        elif app: messagebox.showerror("Download Error", err_msg, parent=settings_window); app.status_var.set("ERROR: Model download failed.")
-        return False
-    except zipfile.BadZipFile:
-        err_msg = f"Model extraction failed: Downloaded file '{model_zip_path}' is not a valid zip archive."
-        print(f"\n[ERROR] {err_msg}")
-        if threading.current_thread() is not threading.main_thread(): gui_queue.put(("error", "Model extraction failed: Invalid zip file."))
-        elif app: messagebox.showerror("Extraction Error", err_msg, parent=settings_window); app.status_var.set("ERROR: Model extraction failed.")
-        return False
+        sd._terminate()
+        sd._initialize()
     except Exception as e:
-        err_msg = f"Model setup failed: {e}"
-        print(f"\n[ERROR] An unexpected error occurred during model download/extraction: {e}")
-        if threading.current_thread() is not threading.main_thread(): gui_queue.put(("error", err_msg))
-        elif app: messagebox.showerror("Setup Error", err_msg, parent=settings_window); app.status_var.set("ERROR: Model setup failed.")
-        return False
-    finally:
-        # Clean up the downloaded zip file regardless of success/failure
-        if os.path.exists(model_zip_path):
-            try:
-                os.remove(model_zip_path)
-                print(f"Cleaned up temporary file: {model_zip_path}")
-            except OSError as e:
-                print(f"[Warning] Could not remove temporary zip file '{model_zip_path}': {e}")
+        print(f"PortAudio re-init failed: {e}")
 
-    # Report success via GUI
-    status_msg = f"Model '{model_key}' ready in {target_base_dir}."
-    if threading.current_thread() is not threading.main_thread(): gui_queue.put(("status", status_msg))
-    elif app: app.status_var.set(status_msg)
 
-    return True # Indicate success
-
-# --- Global State Variables ---
-# Re-add Vosk specific audio queue
-vosk_audio_queue = queue.Queue() # Separate queue for Vosk audio data
-gui_queue = queue.Queue()   # FIFO buffer for message passing to the UI thread
-stop_event = threading.Event() # Used to signal termination for background listener AND Vosk worker
-# Handles for different audio mechanisms
-sd_stream = None # sounddevice stream handle (for Vosk)
-vosk_worker_thread = None # Vosk processing thread handle
-sr_recognizer = None # Global recognizer instance from SpeechRecognition (for Whisper/Google)
-sr_microphone = None # Global microphone instance from SpeechRecognition
-sr_audio_source = None # Global audio source instance from SpeechRecognition
-sr_background_listener_stop_func = None # Function to stop SR background listening
-
-selected_device_index = None # Index identifier for the chosen audio input device
-is_running = False # Boolean flag indicating active transcription state
-current_vosk_model_path = None # Store the loaded Vosk model path
-google_creds_json = None # Store loaded Google credentials content
-current_whisper_size = None # Store selected Whisper model size
-stop_handler_thread = None # Thread to handle stopping audio sources
-
-# --- Audio Subsystem Functions ---
-# MODIFIED list_audio_devices function
 def list_audio_devices():
-    """Lists available audio input and loopback devices using sounddevice."""
-    print("Listing available audio sources (Input & Loopback via sounddevice)...")
+    """Map of display name -> source descriptor.
+
+    Descriptors are (kind, index, device_name):
+      ("sd", i, name)        - regular input via sounddevice
+      ("loopback", i, name)  - system audio via WASAPI loopback (pyaudiowpatch)
+      ("mix", None, None)    - default mic + default system audio, mixed
+    Indices are re-resolved by name when a session starts, so a stale list
+    can't open the wrong device.
+    """
     devices = {}
     try:
-        sd_devices = sd.query_devices()
-        hostapis = sd.query_hostapis()
-        default_input_idx = sd.default.device[0] # Default input device index
-        default_output_idx = sd.default.device[1] # Default output device index
-
-        print(f"Default Input Device Index: {default_input_idx}")
-        print(f"Default Output Device Index: {default_output_idx}")
-
-        for i, device in enumerate(sd_devices):
-            device_name = device['name']
-            hostapi_idx = device['hostapi']
-            hostapi_name = hostapis[hostapi_idx]['name']
-
-            # Mark default devices
-            default_marker = ""
-            if i == default_input_idx and i == default_output_idx:
-                default_marker = " (Default Input & Output)"
-            elif i == default_input_idx:
-                default_marker = " (Default Input)"
-            elif i == default_output_idx:
-                default_marker = " (Default Output)"
-
-
-            # --- Criteria for including a device as a potential source ---
-            include_device = False
-            source_type = ""
-
-            # 1. Standard Input Devices
-            if device['max_input_channels'] > 0:
-                include_device = True
-                source_type = "Input"
-
-            # 2. Loopback Devices (Windows WASAPI specific identification)
-            #    WASAPI loopback devices typically have input channels = 0
-            #    but are associated with an output device.
-            #    Their names often contain "(loopback)".
-            if sys.platform == 'win32' and hostapi_name == 'Windows WASAPI':
-                 # Check if it's an output device that might have a loopback pair
-                 # Note: sounddevice doesn't directly expose a "is_loopback" flag.
-                 # We rely on naming convention or listing output devices as potential sources.
-                 # A common loopback name is based on the corresponding output device.
-                 if device['max_output_channels'] > 0 and device['max_input_channels'] == 0:
-                     # Tentatively include output devices under WASAPI as potential loopback sources
-                     # The user might need to manually enable "Stereo Mix" or similar in Windows Sound settings
-                     # if a dedicated loopback device isn't listed.
-                     # Or, a more direct loopback device might be listed separately (often with 0 output channels)
-                     include_device = True
-                     source_type = "Output/Loopback?"
-
-                 # Also check for devices explicitly named loopback by the driver
-                 if 'loopback' in device_name.lower() and device['max_input_channels'] > 0:
-                     include_device = True # Explicit loopback device found
-                     source_type = "Loopback"
-
-
-            # 3. Default Output Device (as potential loopback source if not already included)
-            #    Sometimes the default output device itself can be recorded from using loopback.
-            if i == default_output_idx and not include_device and device['max_output_channels'] > 0:
-                 # Let's add the default output explicitly, user might want to try capturing it
-                 include_device = True
-                 source_type = "Default Output (Try Loopback?)"
-
-
-            if include_device:
-                 list_entry_name = f"{i}: {device_name}{default_marker} [{source_type} - {hostapi_name}]"
-                 devices[list_entry_name] = i # Store display name -> index
-                 print(f"  Found: {list_entry_name} (In:{device['max_input_channels']}, Out:{device['max_output_channels']})")
-
-
-        if not devices:
-            print(" No suitable audio sources found by sounddevice.")
-            # Fallback to SpeechRecognition list if sounddevice fails? Less ideal.
-            try:
-                 print(" Falling back to SpeechRecognition/PyAudio device list...")
-                 mic_names = sr.Microphone.list_microphone_names()
-                 devices = {f"{i}: {name} (PyAudio Fallback)": i for i, name in enumerate(mic_names)}
-            except Exception as e_sr:
-                 print(f" Error listing devices via SpeechRecognition fallback: {e_sr}")
-
-    except Exception as e:
-        print(f" Error listing devices via sounddevice: {e}")
-        # Attempt fallback to SpeechRecognition listing
+        all_devs = sd.query_devices()
+        apis = sd.query_hostapis()
+        # The default-input index usually points at an MME/DirectSound entry;
+        # remember its *name* so the matching WASAPI entry gets marked too.
+        default_name = None
         try:
-            print(" Error during sounddevice query. Falling back to SpeechRecognition/PyAudio device list...")
-            mic_names = sr.Microphone.list_microphone_names()
-            devices = {f"{i}: {name} (PyAudio Fallback)": i for i, name in enumerate(mic_names)}
-        except Exception as e_sr:
-            print(f" Error listing devices via SpeechRecognition fallback: {e_sr}")
-
-
-    print(f"--- Final Device List ({len(devices)} sources) ---")
-    # for name in devices.keys(): print(f" - {name}") # Optionally print final list
-    print("-----------------------------------------")
-
-    # We now return the dictionary generated primarily by sounddevice
-    return devices
-# END OF MODIFIED list_audio_devices function
-
-
-# --- Vosk Specific Audio Callback & Worker ---
-def vosk_audio_callback(indata, frames, time_info, status):
-    """Callback executed by sounddevice upon receiving a new audio data frame (for Vosk)."""
-    if status: # Report any non-nominal status flags
-        gui_queue.put(("status", f"Audio System Status (Vosk): {status}"))
-    # Enqueue the raw audio data (numpy array converted to bytes) if system is active
-    if is_running and not stop_event.is_set():
-        # Check data type - needs to be bytes
-        try:
-            vosk_audio_queue.put(bytes(indata))
-        except Exception as e:
-             print(f"Error converting/queuing Vosk audio data: {e}") # Should not happen with correct dtype
-             gui_queue.put(("error", f"Vosk audio data error: {e}"))
-             # Optionally stop here?
-             # stop_event.set()
-
-
-def vosk_transcription_worker():
-    """Dedicated thread for Vosk audio data processing and speech-to-text conversion."""
-    global current_vosk_model_path, selected_device_index # Access globals
-    log_file = None # File handle for logging output
-    last_log_time = time.time() # Timestamp for periodic log flushing
-    # Retrieve parameters from configuration
-    enable_logging = config.getboolean('Settings', 'enable_logging', fallback=True)
-    log_file_path_str = config.get('Audio', 'log_file', fallback='live_transcription.log')
-
-    try:
-        # --- Determine Model Path (MUST be set and valid) ---
-        # This logic should already be validated before starting the thread, but double-check
-        if not current_vosk_model_path or not os.path.exists(current_vosk_model_path):
-             raise FileNotFoundError(f"Vosk worker started without a valid model path: {current_vosk_model_path}")
-
-        # --- Initialize Logging Subsystem ---
-        base_app_path = get_base_path()
-        if not os.path.isabs(log_file_path_str):
-             log_file_path = os.path.join(base_app_path, log_file_path_str)
-        else:
-             log_file_path = log_file_path_str
-
-        if enable_logging:
-            try:
-                log_dir = os.path.dirname(log_file_path)
-                if log_dir: os.makedirs(log_dir, exist_ok=True)
-                log_file = open(log_file_path, "a", encoding="utf-8")
-                gui_queue.put(("status", f"Logging enabled: {log_file_path}"))
-            except Exception as e:
-                gui_queue.put(("status", f"Log file error: {e}. Logging disabled."))
-                enable_logging = False
-
-        # --- Initialize Vosk Speech Recognition Engine ---
-        gui_queue.put(("status", f"Initializing Vosk engine (Model: {os.path.basename(current_vosk_model_path)})..."))
-        model = vosk.Model(current_vosk_model_path) # Load the acoustic/language model
-
-        # Query selected audio device for its native sample rate (using sounddevice index)
-        print(f"Attempting to use sounddevice index for Vosk: {selected_device_index}")
-        device_info = sd.query_devices(selected_device_index) # Get info for the selected index
-        # Determine if it's an input or loopback - Vosk needs sample rate
-        samplerate = int(device_info['default_samplerate']) # Use device's sample rate (Hz)
-        if samplerate == 0: # Sample rate might be 0 for some loopback devices, try default output rate?
-             print(f"Warning: Selected device {selected_device_index} has 0Hz sample rate. Trying default output device rate.")
-             default_output_idx = sd.default.device[1]
-             default_output_info = sd.query_devices(default_output_idx)
-             samplerate = int(default_output_info['default_samplerate'])
-             if samplerate == 0: # Still zero? Fallback to a common rate
-                  print("Warning: Default output also 0Hz. Falling back to 48000 Hz for Vosk.")
-                  samplerate = 48000
-
-        # Instantiate the recognizer with the model and sample rate
-        recognizer = vosk.KaldiRecognizer(model, samplerate)
-        recognizer.SetWords(True) # Request word-level timing information (optional)
-        # recognizer.SetPartialWords(True) # Vosk partial results less straightforward to integrate here
-
-        gui_queue.put(("status", f"Listening via '{device_info['name']}' (Sample Rate: {samplerate} Hz)")) # Inform UI
-
-        # --- Main Processing Loop ---
-        while not stop_event.is_set(): # Continue until termination signal
-            try:
-                # Dequeue audio data; block for max 0.5s if queue is empty
-                data = vosk_audio_queue.get(timeout=0.5)
-
-                # Feed audio data chunk to the Vosk recognizer
-                if recognizer.AcceptWaveform(data):
-                    result_json = recognizer.Result() # Get final recognition result
-                    result_dict = json.loads(result_json) # Parse JSON result
-                    if result_dict.get("text"): # Check if text was recognized
-                        text = result_dict["text"]
-                        timestamp = datetime.now().strftime("%H:%M:%S") # Generate timestamp
-                        # Send complete transcript segment to the GUI queue
-                        gui_queue.put(("transcript", f"[{timestamp}] {text}"))
-                        gui_queue.put(("status", "Listening...")) # Reset status
-                        # Log to file if enabled
-                        if enable_logging and log_file:
-                            log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
-                            # Periodically flush buffer to disk (e.g., every 5 seconds)
-                            current_time = time.time()
-                            if current_time - last_log_time > 5.0:
-                                log_file.flush()
-                                last_log_time = current_time
-                # else: # Handle partial results if enabled
-                #     partial_json = recognizer.PartialResult()
-                #     partial_dict = json.loads(partial_json)
-                #     if partial_dict.get("partial"):
-                #          gui_queue.put(("partial", partial_dict["partial"]))
-
-            except queue.Empty:
-                # Queue was empty within the timeout; signifies silence or processing catch-up
-                continue # Loop again to wait for more data
-            except Exception as e:
-                 # Log processing errors to the GUI status
-                 gui_queue.put(("status", f"Vosk Worker Error: {e}"))
-                 time.sleep(1) # Avoid busy-looping on persistent errors
-
-    # --- Error Handling & Cleanup ---
-    except sd.PortAudioError as pae:
-        # Specific error if sounddevice fails to open stream (e.g., wrong index, format mismatch)
-        print(f"Sounddevice/PortAudio Error in Vosk worker: {pae}")
-        error_detail = f"Audio Device Error (Vosk): {pae}\nCheck device index '{selected_device_index}' or try another source/engine."
-        # Add WASAPI specific hint for loopback
-        if sys.platform == 'win32' and 'Windows WASAPI' in str(pae) and 'Invalid number of channels' in str(pae):
-             error_detail += "\n\nHint: If using loopback, ensure 'Stereo Mix' (or similar) is enabled and set as default recording device in Windows Sound settings, OR try selecting the specific output device directly."
-        gui_queue.put(("error", error_detail))
-    except FileNotFoundError as e:
-        gui_queue.put(("error", f"Vosk/Model Error: {e}"))
-    except RuntimeError as e:
-        gui_queue.put(("error", f"Vosk Setup Error: {e}"))
-    except Exception as e:
-        gui_queue.put(("error", f"Critical Vosk Worker Error: {e}"))
-    finally:
-        # This block executes regardless of exceptions, ensuring cleanup
-        gui_queue.put(("status", "Vosk worker shutting down..."))
-        if enable_logging and log_file:
-            try:
-                log_file.flush(); log_file.close()
-                gui_queue.put(("status", "Log file closed."))
-            except Exception as e:
-                 gui_queue.put(("status", f"Error closing log file: {e}"))
-        # Ensure the main loop knows to stop if the worker terminates unexpectedly
-        stop_event.set()
-
-
-# --- SpeechRecognition Engine Callback ---
-# MODIFIED process_audio_callback function (from previous step)
-def process_audio_callback(r, audio):
-    """Callback executed by SpeechRecognition's listen_in_background (for Whisper/Google)."""
-
-    global google_creds_json, current_whisper_size # Access necessary globals
-
-    if stop_event.is_set(): # Check if we should stop processing
-        return
-
-    engine = config.get('Engine', 'type', fallback='vosk') # Check engine again in case it changed? Risky. Assume it's Whisper/Google here.
-    timestamp = datetime.now().strftime("%H:%M:%S") # Timestamp for log entry
-
-    try:
-        text = ""
-        gui_queue.put(("status", f"Processing with {engine}...")) # Indicate processing start
-
-        if engine == 'google_cloud':
-            if not google_creds_json:
-                raise RuntimeError("Google Cloud engine selected but no valid credentials loaded.")
-            text = r.recognize_google_cloud(audio, credentials_json=google_creds_json)
-
-        elif engine == 'whisper':
-            if not current_whisper_size:
-                 raise RuntimeError("Whisper engine selected but no model size configured.")
-            # print(f"Using Whisper model: {current_whisper_size}") # Debug: Keep this print commented out or remove
-            # May need language="en" depending on audio / desired outcome
-            text = r.recognize_whisper(audio, model=current_whisper_size, language="english")
-
-        else:
-             # This callback should only be active for SR engines
-             # MODIFICATION: Removed print statement
-             # print(f"Warning: process_audio_callback called for unexpected engine: {engine}")
-             gui_queue.put(("status", f"Warning: Invalid engine '{engine}' in callback.")) # Report via GUI
-             return
-
-        if text: # Only queue if text is recognized
-             gui_queue.put(("transcript", f"[{timestamp}] {text}"))
-             gui_queue.put(("status", "Listening...")) # Reset status after successful transcript
-
-    except sr.WaitTimeoutError: pass # Should not happen with listen_in_background
-    except sr.UnknownValueError:
-        gui_queue.put(("status", "Listening... (No speech detected)"))
-        pass
-    except sr.RequestError as e:
-        # MODIFICATION: Removed print statement
-        # print(f"API request failed for engine '{engine}': {e}")
-        gui_queue.put(("error", f"API Error ({engine}): {e}"))
-    except Exception as e:
-        # MODIFICATION: Removed print statement
-        # print(f"Unexpected error during recognition with {engine}: {e}")
-        # Make the error message more specific for the GUI
-        gui_queue.put(("error", f"Recognition Error ({engine}): {e}"))
-        # Also print to console IF possible, but don't crash if not
-        try:
-            # Use a different way to print that might work even if stdout is broken
-            with open(os.devnull, "w") as fnull: # Try opening devnull to see if basic IO works
-                print(f"*** Recognition Error ({engine}): {e} ***", file=fnull) # Try writing somewhere valid
-            # Or attempt to write to original stderr if it exists
-            if sys.__stderr__:
-                 print(f"*** Recognition Error ({engine}): {e} ***", file=sys.__stderr__)
+            default_in = sd.default.device[0]
+            if 0 <= default_in < len(all_devs):
+                default_name = all_devs[default_in]["name"]
         except Exception:
-            pass # Ignore if printing fails
+            default_in = -1
+        entries = []
+        for i, d in enumerate(all_devs):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            api_name = apis[d["hostapi"]]["name"]
+            entries.append((i, d, api_name))
+        if sys.platform == "win32":
+            wasapi = [e for e in entries if "WASAPI" in e[2]]
+            if wasapi:
+                entries = wasapi
+        for i, d, api_name in entries:
+            is_default = i == default_in or (
+                default_name is not None
+                and (d["name"] in default_name or default_name in d["name"]))
+            mark = "  (default)" if is_default else ""
+            devices[f"{i}: {d['name']} [{api_name}]{mark}"] = ("sd", i, d["name"])
+    except Exception as e:
+        print(f"Error listing audio devices: {e}")
 
-# END OF MODIFIED process_audio_callback function
-
-
-# --- Stop Handler Function (runs in separate thread) ---
-# MODIFIED _perform_stop function (from previous step)
-def _perform_stop():
-    """Handles the actual stopping of audio streams/listeners in a background thread."""
-    # MODIFICATION START: Add global is_running access to set it False reliably
-    global is_running, sr_background_listener_stop_func, sd_stream, vosk_worker_thread
-    global sr_recognizer, sr_microphone, sr_audio_source # Clear SR globals too
-
-    print("Stop handler thread started.")
-    engine_stopped = False
-
-    try: # Wrap main stopping logic in try...finally
-        # --- Stop SR Listener ---
-        if sr_background_listener_stop_func:
+    # System-audio (loopback) sources - what the PC is playing. Covers both
+    # plain speaker/headphone setups and each GoXLR output channel.
+    if HAVE_LOOPBACK:
+        try:
+            pa = pyaudio_patch.PyAudio()
             try:
-                print("Calling SR background listener stop function...")
-                sr_background_listener_stop_func(wait_for_stop=False) # Non-blocking stop
-                print("SR Background listener stop function called.")
-                engine_stopped = True
-            except Exception as e:
-                 print(f"Error calling SR background listener stop function: {e}")
-                 gui_queue.put(("error", f"Error stopping listener: {e}")) # Report error to GUI
-        # Clear SR globals whether stop worked or not
-        sr_background_listener_stop_func = None
-        sr_recognizer = None
-        sr_microphone = None
-        sr_audio_source = None
+                for d in pa.get_loopback_device_info_generator():
+                    clean = d["name"].replace(" [Loopback]", "")
+                    devices[f"\U0001F50A System audio: {clean}"] = ("loopback", int(d["index"]), d["name"])
+            finally:
+                pa.terminate()
+        except Exception as e:
+            print(f"Error listing loopback devices: {e}")
+        if devices:
+            devices[MIX_SOURCE_LABEL] = ("mix", None, None)
+    return devices
 
-        # --- Stop Vosk Stream and Worker ---
-        # Stop stream first to prevent callback putting more data in queue
-        if sd_stream: # Check if stream object exists
-            print("Attempting to stop sounddevice stream...")
-            try:
-                if sd_stream.active: # Check if active before stopping
-                     print("  Calling sd_stream.stop()...")
-                     sd_stream.stop()
-                     print("  Calling sd_stream.close()...")
-                     sd_stream.close()
-                print("Sounddevice stream stopped/closed.")
-                engine_stopped = True
-            except Exception as e:
-                 # MODIFICATION: Improved error reporting for stream stop/close
-                 print(f"Error stopping/closing sounddevice stream: {e}")
-                 gui_queue.put(("error", f"Error stopping audio stream: {e}")) # Report error
-        sd_stream = None # Clear handle
 
-        # Wait briefly for worker thread (it checks stop_event and queue timeout)
-        # We still signal it via stop_event, but don't join from GUI thread
-        if vosk_worker_thread and vosk_worker_thread.is_alive():
-             print("Signaled Vosk worker thread to stop (no join)...")
-             # Let the daemon thread exit on its own or when app closes
-        vosk_worker_thread = None # Clear the thread handle
+def float_to_int16_bytes(audio_f32):
+    return (np.clip(audio_f32, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
-    except Exception as e_outer:
-        # Catch unexpected errors in the main try block of _perform_stop
-        print(f"Unexpected error during stop sequence: {e_outer}")
-        gui_queue.put(("error", f"Unexpected stop error: {e_outer}"))
+
+def resample_audio(audio_f32, rate_from, rate_to):
+    if rate_from == rate_to or not len(audio_f32):
+        return audio_f32.astype(np.float32, copy=False)
+    n_out = max(1, int(round(len(audio_f32) * float(rate_to) / rate_from)))
+    x_old = np.arange(len(audio_f32), dtype=np.float64)
+    x_new = np.linspace(0.0, len(audio_f32) - 1, n_out)
+    return np.interp(x_new, x_old, audio_f32).astype(np.float32)
+
+
+def resample_to_16k(audio_f32, rate):
+    return resample_audio(audio_f32, rate, 16000)
+
+
+def get_energy_threshold():
+    """Configured RMS threshold (0..1), or None to auto-calibrate."""
+    raw = config.get("Audio", "energy_threshold", fallback="auto").strip().lower()
+    if raw in ("", "auto"):
+        return None
+    try:
+        return max(0.0005, float(raw))
+    except ValueError:
+        return None
+
+
+def available_engines():
+    return [key for key, spec in ENGINES.items() if spec["available"]()]
+
+
+def resolve_vosk_model_path():
+    """Return (path, error). One of the two is always None."""
+    preferred = config.get("Models", "preferred_vosk_model_type", fallback=DEFAULT_VOSK_MODEL_TYPE)
+    base = get_base_path()
+    if preferred == "custom":
+        p = config.get("Paths", "custom_model_path", fallback="")
+        if not p:
+            return None, "Custom Vosk model selected but no path is set (Settings > Vosk)."
+        if not os.path.isabs(p):
+            p = os.path.join(base, p)
+        if not os.path.isdir(p):
+            return None, f"Custom Vosk model folder not found:\n{p}"
+        return p, None
+    if preferred in MODEL_INFO:
+        d = os.path.join(base, config.get("Models", "model_directory", fallback=MODEL_BASE_DIR),
+                         MODEL_INFO[preferred]["extracted_dir_name"])
+        if not os.path.isdir(d):
+            return None, f"Vosk model '{preferred}' is not downloaded yet.\nUse Settings > Vosk > Download."
+        return d, None
+    return None, f"Invalid Vosk model type '{preferred}' in config."
+
+
+def vosk_model_downloaded(key):
+    if key not in MODEL_INFO:
+        return False
+    d = os.path.join(get_base_path(), config.get("Models", "model_directory", fallback=MODEL_BASE_DIR),
+                     MODEL_INFO[key]["extracted_dir_name"])
+    return os.path.isdir(d)
+
+
+def sherpa_model_downloaded(key):
+    if key not in SHERPA_MODELS:
+        return False
+    return os.path.isdir(os.path.join(get_base_path(), SHERPA_BASE_DIR,
+                                      SHERPA_MODELS[key]["dir_name"]))
+
+
+def resolve_sherpa_model_dir():
+    """Return (model_dir, error). One of the two is always None."""
+    choice = config.get("Sherpa", "model", fallback=DEFAULT_SHERPA_MODEL)
+    if choice == "custom":
+        d = config.get("Sherpa", "custom_model_dir", fallback="")
+        if not d:
+            return None, "Custom Sherpa model selected but no folder is set (Settings > Streaming)."
+        if not os.path.isabs(d):
+            d = os.path.join(get_base_path(), d)
+        if not os.path.isdir(d):
+            return None, f"Custom Sherpa model folder not found:\n{d}"
+        return d, None
+    if choice in SHERPA_MODELS:
+        d = os.path.join(get_base_path(), SHERPA_BASE_DIR, SHERPA_MODELS[choice]["dir_name"])
+        if not os.path.isdir(d):
+            return None, f"Sherpa model '{choice}' is not downloaded yet.\nUse Settings > Streaming > Download."
+        return d, None
+    return None, f"Invalid Sherpa model '{choice}' in config."
+
+
+def find_sherpa_files(model_dir):
+    """Locate the transducer files inside a sherpa-onnx model folder."""
+    def pick(pattern):
+        matches = sorted(glob.glob(os.path.join(model_dir, pattern)))
+        if not matches:
+            raise RuntimeError(f"No '{pattern}' file found in {model_dir}")
+        full = [m for m in matches if "int8" not in os.path.basename(m)]
+        return (full or matches)[0]
+    tokens = os.path.join(model_dir, "tokens.txt")
+    if not os.path.exists(tokens):
+        raise RuntimeError(f"No tokens.txt found in {model_dir}")
+    return pick("encoder*.onnx"), pick("decoder*.onnx"), pick("joiner*.onnx"), tokens
+
+
+def speaker_model_path():
+    return os.path.join(get_base_path(), SPEAKER_MODEL_DIR, SPEAKER_MODEL_FILE)
+
+
+def speaker_labels_active():
+    return (config.getboolean("Speakers", "enabled", fallback=True)
+            and HAVE_SHERPA and os.path.exists(speaker_model_path()))
+
+
+class SpeakerRegistry:
+    """Assigns 'Speaker N' labels by clustering voice embeddings.
+
+    Embeddings come from a sherpa-onnx speaker model; new utterances are
+    matched against running per-speaker centroids by cosine similarity.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.centroids = []  # list of [unit-norm embedding, sample count]
+        self._extractor = None
+        self._extractor_path = None
+
+    def _get_extractor(self):
+        path = speaker_model_path()
+        if not (HAVE_SHERPA and os.path.exists(path)):
+            return None
+        if self._extractor is None or self._extractor_path != path:
+            cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=path, num_threads=2)
+            self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
+            self._extractor_path = path
+        return self._extractor
+
+    def label(self, audio_16k):
+        """Return a 'Speaker N' label for a mono 16 kHz float32 utterance."""
+        if audio_16k is None or len(audio_16k) < int(0.8 * 16000):
+            return None
+        try:
+            with self.lock:
+                ext = self._get_extractor()
+                if ext is None:
+                    return None
+                stream = ext.create_stream()
+                stream.accept_waveform(16000, audio_16k)
+                stream.input_finished()
+                emb = np.asarray(ext.compute(stream), dtype=np.float32)
+                norm = float(np.linalg.norm(emb))
+                if not norm:
+                    return None
+                emb /= norm
+                threshold = config.getfloat("Speakers", "similarity_threshold", fallback=0.45)
+                max_speakers = config.getint("Speakers", "max_speakers", fallback=8)
+                best_idx, best_sim = -1, -1.0
+                for i, (centroid, _count) in enumerate(self.centroids):
+                    sim = float(np.dot(emb, centroid))
+                    if sim > best_sim:
+                        best_idx, best_sim = i, sim
+                if best_idx >= 0 and (best_sim >= threshold or len(self.centroids) >= max_speakers):
+                    centroid, count = self.centroids[best_idx]
+                    updated = centroid * count + emb
+                    updated /= float(np.linalg.norm(updated)) or 1.0
+                    self.centroids[best_idx] = [updated, count + 1]
+                    return f"Speaker {best_idx + 1}"
+                self.centroids.append([emb, 1])
+                return f"Speaker {len(self.centroids)}"
+        except Exception as e:
+            print(f"Speaker labelling error: {e}")
+            return None
+
+    def reset(self):
+        with self.lock:
+            self.centroids = []
+
+
+speaker_registry = SpeakerRegistry()
+
+
+def _download_to_file(url, dest, out_q, label):
+    """Stream a URL to a file, posting progress. Raises on failure."""
+    if not HAVE_REQUESTS:
+        raise RuntimeError("The 'requests' package is required for downloads (pip install requests).")
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        done = 0
+        last = 0.0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    done += len(chunk)
+                    now = time.time()
+                    if now - last > 0.4:
+                        last = now
+                        if total:
+                            out_q.put(("status", f"Downloading {label}: {done/1048576:.0f} / {total/1048576:.0f} MB ({100*done/total:.0f}%)"))
+                        else:
+                            out_q.put(("status", f"Downloading {label}: {done/1048576:.0f} MB"))
+
+
+def download_vosk_model(model_key, out_q):
+    """Download + extract a Vosk model. Runs on a worker thread; reports via out_q."""
+    ok, err = False, None
+    label = f"Vosk model '{model_key}'"
+    info = MODEL_INFO[model_key]
+    target_dir = os.path.join(get_base_path(), config.get("Models", "model_directory", fallback=MODEL_BASE_DIR))
+    zip_path = os.path.join(target_dir, f"vosk_model_{model_key}.zip")
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        _download_to_file(info["url"], zip_path, out_q, label)
+        out_q.put(("status", f"Extracting {label}..."))
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(target_dir)
+        if not vosk_model_downloaded(model_key):
+            raise RuntimeError("Archive extracted but the expected model folder was not found.")
+        ok = True
+    except Exception as e:
+        err = str(e)
     finally:
-        # --- Signal GUI Update ---
-        # MODIFICATION: Moved GUI update and is_running = False into finally block
-        print("Stop handler thread finished execution (inside finally block).")
-        # Send message to re-enable controls and set final status
-        # This will now run even if errors occurred during stopping
-        gui_queue.put(("enable_controls", True))
-        is_running = False # Reliably set is_running to False here
-        print("Sent enable_controls message and set is_running=False.")
-# END OF MODIFIED _perform_stop function
-
-
-# --- Graphical User Interface (Tkinter) Application Class ---
-class TranscriberApp:
-    def __init__(self, root_window):
-        self.root = root_window
-        self.root.title("Live Transcriber (Online/Offline)") # Updated title
-        # Set initial and minimum size for the main window
-        self.root.geometry("750x500") # MODIFICATION: Increased width slightly for longer device names
-        self.root.minsize(750, 400)   # MODIFICATION: Increased min width
-        # Register callback for window close event (X button)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.settings_window = None # Placeholder for the settings Toplevel window
-        self.style = ttk.Style() # Store style object
-
-        # --- Top Frame for Controls ---
-        self.controls_frame = ttk.Frame(root_window, padding="10", style="Controls.TFrame") # Assign style
-        self.controls_frame.pack(side=tk.TOP, fill=tk.X) # Pack at top, fill horizontally
-
-        # MODIFICATION: Changed label text
-        self.controls_label = ttk.Label(self.controls_frame, text="Audio Source:", style="Controls.TLabel") # Store ref
-        self.controls_label.pack(side=tk.LEFT, padx=(0, 5)) # Assign style
-
-        self.devices = list_audio_devices() # MODIFICATION: Use updated device listing function
-        self.device_var = tk.StringVar() # Tkinter variable bound to combobox
-        # Create dropdown menu for device selection
-        # MODIFICATION: Increased combobox width for longer names
-        self.device_combobox = ttk.Combobox(self.controls_frame, textvariable=self.device_var,
-                                            values=list(self.devices.keys()), state="readonly", width=50)
-        if not self.devices: # Handle case where no input devices are found
-             self.device_var.set("No audio sources detected")
-             self.device_combobox.config(state=tk.DISABLED)
-        else:
-            # Attempt to load last used device from configuration
-            # MODIFICATION: Use updated config key 'audio_source_name'
-            saved_device_name = config.get('Audio', 'audio_source_name', fallback='')
-            # Use a more robust check: Exact match first, then partial
-            exact_match = [k for k in self.devices.keys() if saved_device_name == k]
-            if exact_match:
-                 self.device_var.set(exact_match[0])
-            else:
-                # Check if saved name is PART of any current device name (less reliable)
-                partial_matches = [k for k in self.devices.keys() if saved_device_name and saved_device_name in k] # Simple substring match
-                if partial_matches:
-                    self.device_var.set(partial_matches[0])
-                else:
-                    # Try to select default input device if available
-                    default_input_keys = [k for k in self.devices.keys() if '(Default Input)' in k]
-                    if default_input_keys:
-                         self.device_var.set(default_input_keys[0])
-                    else:
-                         # Fallback to first device in the list
-                         self.device_var.set(list(self.devices.keys())[0])
-
-            # Save the initially selected device name back to config (in case it was a fallback)
-            config.set('Audio', 'audio_source_name', self.device_var.get())
-
-
-        self.device_combobox.pack(side=tk.LEFT, padx=5)
-        # MODIFICATION: Add callback for device change to save selection
-        self.device_combobox.bind('<<ComboboxSelected>>', self.on_device_change)
-
-
-        # Start/Stop control buttons
-        self.start_button = ttk.Button(self.controls_frame, text="Start Acquisition", command=self.start_transcription, style="Controls.TButton") # Assign style
-        if not self.devices: self.start_button.config(state=tk.DISABLED) # Disable if no devices
-        self.start_button.pack(side=tk.LEFT, padx=5)
-
-        self.stop_button = ttk.Button(self.controls_frame, text="Stop Acquisition", command=self.stop_transcription, state=tk.DISABLED, style="Controls.TButton") # Assign style
-        self.stop_button.pack(side=tk.LEFT, padx=5)
-
-        # Settings Button - Added
-        self.settings_button = ttk.Button(self.controls_frame, text="Settings", command=self.open_settings_window, style="Controls.TButton") # Assign style
-        self.settings_button.pack(side=tk.LEFT, padx=15) # Add some padding
-
-
-        # --- Transcript Display Area ---
-        # Attempt to use a more common modern font based on OS
-        try: transcript_font = font.Font(family="Segoe UI", size=10) # Windows preference
-        except:
-             try: transcript_font = font.Font(family="San Francisco", size=11) # macOS preference
-             except: transcript_font = font.Font(family="Helvetica", size=11) # Generic fallback
-
-        # Create scrollable text widget for displaying results
-        self.transcript_area = scrolledtext.ScrolledText(root_window, wrap=tk.WORD, state=tk.DISABLED, font=transcript_font, relief=tk.SOLID, borderwidth=1)
-        # Configure colors in apply_theme
-        self.transcript_area.pack(padx=10, pady=(0, 5), expand=True, fill=tk.BOTH) # Fill available space
-
-        # --- Status Bar (Bottom Section) ---
-        self.status_var = tk.StringVar() # Tkinter variable for status text
-        self.status_bar = ttk.Label(root_window, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5, style="Status.TLabel") # Assign style
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X) # Pack at bottom, fill horizontally
-        # MODIFICATION: Updated initial status message
-        self.status_var.set("System Idle. Select audio source and Start Acquisition.")
-
-        # Apply initial theme based on config
-        self.apply_theme(config.get('Settings', 'theme', fallback='light'))
-
-        # Initiate periodic polling of the GUI message queue
-        self.check_gui_queue()
-
-    # --- MODIFICATION START: Add callback for device selection change ---
-    def on_device_change(self, event=None):
-        """Saves the selected device name to config when changed."""
-        selected_name = self.device_var.get()
-        if selected_name and selected_name != "No audio sources detected":
-            print(f"Audio source changed to: {selected_name}")
-            config.set('Audio', 'audio_source_name', selected_name)
-            # No need to call save_config() here unless persistence between sessions
-            # without closing is strictly required. load_config() handles persistence.
-            # If immediate persistence is desired:
-            # save_config()
-    # --- MODIFICATION END ---
-
-
-    def apply_theme(self, mode):
-        """Applies the selected color theme (light/dark) to widgets."""
-        theme = DARK_THEME if mode == 'dark' else LIGHT_THEME
-        fg_col = theme['fg']
-        bg_col = theme['bg']
-        entry_fg = theme['entry_fg']
-        entry_bg = theme['entry_bg']
-        text_fg = theme['text_fg']
-        text_bg = theme['text_bg']
-        btn_fg = theme['button_fg']
-        # btn_bg = theme['button_bg'] # Button BG is unreliable with ttk themes
-        frame_fg = theme['frame_fg']
-        status_fg = theme['status_fg']
-        status_bg = theme['status_bg']
-
-        # Configure root window background
-        self.root.config(bg=bg_col)
-
-        # Configure ttk styles (more reliable for ttk widgets)
-        self.style.configure("TFrame", background=bg_col)
-        self.style.configure("Controls.TFrame", background=bg_col) # Specific style for controls frame
-        self.style.configure("TLabel", background=bg_col, foreground=fg_col)
-        self.style.configure("Status.TLabel", background=status_bg, foreground=status_fg) # Specific style for status bar
-        # Configure Button: Only set foreground reliably
-        self.style.configure("TButton", foreground=btn_fg)
-        # Map allows configuring state-specific colors (e.g., disabled)
-        self.style.map("TButton",
-                       foreground=[('disabled', theme['disabled_fg']), ('active', btn_fg)])
-                       # background=[...] # Avoid setting background for TButton
-        # Configure Combobox and Entry
-        self.style.configure("TCombobox", foreground=entry_fg, fieldbackground=entry_bg) # Set text and field bg
-        self.style.map('TCombobox',
-                       fieldbackground=[('readonly', entry_bg)], # Ensure field bg applies
-                       foreground=[('readonly', entry_fg)],      # Ensure text color applies
-                       selectbackground=[('readonly', status_bg)], # Selection highlight bg
-                       selectforeground=[('readonly', status_fg)]) # Selection highlight text
-        self.style.configure("TEntry", fieldbackground=entry_bg, foreground=entry_fg)
-        # Configure Checkbutton and Radiobutton (background might be inherited)
-        self.style.configure("TCheckbutton", background=bg_col, foreground=fg_col)
-        self.style.configure("TRadiobutton", background=bg_col, foreground=fg_col)
-        # Configure LabelFrame
-        self.style.configure("TLabelFrame", background=bg_col, bordercolor=fg_col) # Border color might not work on all themes
-        self.style.configure("TLabelFrame.Label", background=bg_col, foreground=frame_fg)
-
-
-        # Configure specific widgets (especially non-ttk ones like ScrolledText)
-        self.controls_frame.config(style="Controls.TFrame") # Apply style
-        # Re-apply styles to ensure they take effect after initial creation
-        for widget in self.controls_frame.winfo_children():
-             if isinstance(widget, ttk.Label): widget.config(style="Controls.TLabel")
-             elif isinstance(widget, ttk.Button): widget.config(style="Controls.TButton")
-             elif isinstance(widget, ttk.Combobox): widget.config(style="TCombobox")
-             # Add other ttk widget types if needed
-
-        self.transcript_area.config(background=text_bg, foreground=text_fg,
-                                    insertbackground=fg_col) # Cursor color
-        self.status_bar.config(style="Status.TLabel") # Apply style
-
-        # Apply theme to settings window if it exists
-        if self.settings_window and self.settings_window.winfo_exists():
-            self.apply_theme_to_window(self.settings_window, mode) # Reuse helper
-
-
-    def apply_theme_to_window(self, window, mode):
-        """Applies theme colors specifically to a given window and its ttk children."""
-        theme = DARK_THEME if mode == 'dark' else LIGHT_THEME
-        bg_col = theme['bg']
-        # fg_col = theme['fg'] # Not needed directly here if styles are used
-
-        window.config(bg=bg_col)
-
-        # Apply styles to all ttk widgets within the window
-        # No need to reconfigure styles here, just apply them to widgets
-        for widget in window.winfo_children():
-            self.update_widget_style(widget) # Use recursive helper
-
-    def update_widget_style(self, widget):
-         """Recursively apply styles to widgets based on current theme."""
-         # Determine current theme mode
-         current_theme_mode = config.get('Settings', 'theme', fallback='light')
-         theme = DARK_THEME if current_theme_mode == 'dark' else LIGHT_THEME
-         bg_col = theme['bg']
-         fg_col = theme['fg']
-
-         widget_class = widget.winfo_class()
-         # Map Tkinter class names to ttk style names (approximate)
-         style_map = {
-             'Frame': 'TFrame', 'LabelFrame': 'TLabelFrame', 'Label': 'TLabel',
-             'Button': 'TButton', 'Entry': 'TEntry', 'Checkbutton': 'TCheckbutton',
-             'Radiobutton': 'TRadiobutton', 'Combobox': 'TCombobox'
-         }
-         # Add specific styles if defined
-         # Check existence of controls_frame before accessing children
-         controls_frame_children = []
-         # Check if self has controls_frame AND if it's not None (safer)
-         if hasattr(self, 'controls_frame') and self.controls_frame:
-             # Check if widget is a child of controls_frame
-             if widget in self.controls_frame.winfo_children():
-                 if isinstance(widget, ttk.Label): style_name = "Controls.TLabel"
-                 elif isinstance(widget, ttk.Button): style_name = "Controls.TButton"
-                 else: style_name = style_map.get(widget_class)
-             elif hasattr(self, 'status_bar') and widget is self.status_bar: # Check status bar specifically
-                 style_name = "Status.TLabel"
-             else:
-                 style_name = style_map.get(widget_class)
-         elif hasattr(self, 'status_bar') and widget is self.status_bar: # Check status bar if controls_frame doesn't exist yet
-              style_name = "Status.TLabel"
-         else:
-             style_name = style_map.get(widget_class)
-
-
-         if style_name:
-             try:
-                 widget.config(style=style_name)
-                 # Explicitly set background for frames/labelframes for better consistency
-                 if widget_class in ['Frame', 'LabelFrame']:
-                      widget.config(style=style_name) # Re-apply style might be needed
-             except tk.TclError: # Widget might not be a ttk widget despite class name
-                 try:
-                     # Fallback for standard tk widgets if needed
-                     widget.config(bg=bg_col, fg=fg_col)
-                 except tk.TclError:
-                     pass # Widget doesn't support bg/fg
-         else:
-             # Apply theme to non-ttk widgets if possible
-             try:
-                 # Special handling for ScrolledText background/foreground
-                 if isinstance(widget, scrolledtext.ScrolledText):
-                      widget.config(bg=theme['text_bg'], fg=theme['text_fg'], insertbackground=fg_col)
-                 else:
-                      widget.config(bg=bg_col, fg=fg_col)
-             except tk.TclError:
-                 pass # Widget doesn't support bg/fg
-
-
-         # Recurse into child widgets
-         for child in widget.winfo_children():
-             self.update_widget_style(child)
-
-
-    def check_gui_queue(self):
-        """Periodically checks the GUI message queue for updates from worker thread."""
         try:
-            # Process all messages currently in the queue without blocking
-            while True:
-                message_type, message_content = gui_queue.get_nowait() # Non-blocking fetch
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except OSError:
+            pass
+    out_q.put(("download_done", (ok, label, err)))
 
-                # Update GUI based on message type
-                if message_type == "transcript":
-                    self.update_transcript(message_content)
-                    # Update status bar if not showing partial result
-                    if is_running and not self.status_var.get().startswith("Partial"): # Check is_running
-                         self.status_var.set("Processing audio stream...")
-                elif message_type == "partial":
-                    # Partial results not directly supported by SR background listener callback easily
-                    # Could potentially use streaming API for online services for this
-                    pass # Ignore partial for now
-                elif message_type == "status":
-                    self.status_var.set(f"System Status: {message_content}")
-                elif message_type == "error":
-                     # Display critical errors via popup and status bar
-                     messagebox.showerror("System Error", message_content)
-                     self.status_var.set(f"CRITICAL ERROR: {message_content}")
-                     # Attempt graceful shutdown on critical error
-                     if is_running:
-                         self.stop_transcription()
-                         # (Existing elif for "error" should be just above here)
-                elif message_type == "enable_controls":
-                    # Message from _perform_stop thread after stopping completes
-                    enable = message_content # Should be True
-                    print("Received enable_controls message from stop handler.")
-                    # Ensure is_running is actually False now (set in _perform_stop's finally block)
-                    if not is_running:
-                        self.start_button.config(state=tk.NORMAL if self.devices and enable else tk.DISABLED)
-                        self.stop_button.config(state=tk.DISABLED) # Stop always disabled after stop finishes
-                        self.device_combobox.config(state="readonly" if self.devices and enable else tk.DISABLED) # Use readonly
-                        self.settings_button.config(state=tk.NORMAL if enable else tk.DISABLED)
-                        if enable:
-                            self.status_var.set("System Idle.")
-                            self.update_transcript("--- Transcription Terminated ---")
-                    else:
-                        # This case should ideally not happen if _perform_stop works correctly
-                        print("WARN: Received enable_controls but is_running is still True!")
-                        # Force GUI update anyway, but log the inconsistency
-                        self.start_button.config(state=tk.NORMAL if self.devices and enable else tk.DISABLED)
-                        self.stop_button.config(state=tk.DISABLED)
-                        self.device_combobox.config(state="readonly" if self.devices and enable else tk.DISABLED) # Use readonly
-                        self.settings_button.config(state=tk.NORMAL if enable else tk.DISABLED)
-                        self.status_var.set("System Idle (State Inconsistency?)")
-                        # (Existing final else: block should be just below here)
-                else:
-                     # Log unexpected message types for debugging
-                     print(f"Unknown GUI message type received: {message_type} - {message_content}")
 
-        except queue.Empty:
-            pass # No messages in queue, normal state
+def download_sherpa_model(model_key, out_q):
+    """Download + extract a sherpa-onnx streaming model (tar.bz2)."""
+    ok, err = False, None
+    label = f"Sherpa model '{model_key}'"
+    info = SHERPA_MODELS[model_key]
+    target_dir = os.path.join(get_base_path(), SHERPA_BASE_DIR)
+    archive = os.path.join(target_dir, f"sherpa_{model_key}.tar.bz2")
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        _download_to_file(info["url"], archive, out_q, label)
+        out_q.put(("status", f"Extracting {label}..."))
+        with tarfile.open(archive, "r:bz2") as t:
+            t.extractall(target_dir, filter="data")
+        if not sherpa_model_downloaded(model_key):
+            raise RuntimeError("Archive extracted but the expected model folder was not found.")
+        ok = True
+    except Exception as e:
+        err = str(e)
+    finally:
+        try:
+            if os.path.exists(archive):
+                os.remove(archive)
+        except OSError:
+            pass
+    out_q.put(("download_done", (ok, label, err)))
+
+
+def download_speaker_model(out_q):
+    """Download the speaker-embedding model used for speaker labels."""
+    ok, err = False, None
+    label = "speaker recognition model"
+    dest = speaker_model_path()
+    tmp = dest + ".part"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        _download_to_file(SPEAKER_MODEL_URL, tmp, out_q, label)
+        os.replace(tmp, dest)
+        ok = True
+    except Exception as e:
+        err = str(e)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    out_q.put(("download_done", (ok, label, err)))
+
+
+# --- Engine registry -----------------------------------------------------------
+# Every engine is one ENGINES entry. To add a new engine:
+#   1. write a prepare_*(status) function returning one of
+#        ("vosk", vosk_model)           -> fed by the Vosk streaming loop
+#        ("sherpa", online_recognizer)  -> fed by the sherpa streaming loop
+#        ("segment", recognize)         -> recognize(float32_audio, rate) -> text,
+#                                          fed by the built-in VAD segmenter
+#   2. add an ENGINES entry below.
+# The engine dropdown, Settings page and validation all build themselves
+# from this registry. New downloadable Vosk/Sherpa models can also be added
+# without code via a models.json file (see load_model_catalog).
+
+def prepare_vosk(status):
+    if not HAVE_VOSK:
+        raise RuntimeError("Vosk is not installed (pip install vosk).")
+    path, err = resolve_vosk_model_path()
+    if err:
+        raise RuntimeError(err)
+    key = ("vosk", path)
+    model = _model_cache.get(key)
+    if model is None:
+        status(f"Loading Vosk model '{os.path.basename(path)}'...")
+        try:
+            vosk.SetLogLevel(-1)
+        except Exception:
+            pass
+        model = vosk.Model(path)
+        _model_cache[key] = model
+    return "vosk", model
+
+
+def prepare_sherpa(status):
+    if not HAVE_SHERPA:
+        raise RuntimeError("sherpa-onnx is not installed (pip install sherpa-onnx).")
+    model_dir, err = resolve_sherpa_model_dir()
+    if err:
+        raise RuntimeError(err)
+    pause = config.getfloat("Audio", "pause_threshold", fallback=0.7)
+    key = ("sherpa", model_dir, round(pause, 2))
+    recognizer = _model_cache.get(key)
+    if recognizer is None:
+        status(f"Loading Sherpa model '{os.path.basename(model_dir)}'...")
+        encoder, decoder, joiner, tokens = find_sherpa_files(model_dir)
+        recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=tokens, encoder=encoder, decoder=decoder, joiner=joiner,
+            num_threads=2, sample_rate=16000, feature_dim=80,
+            decoding_method="greedy_search",
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=2.4,
+            rule2_min_trailing_silence=max(0.6, pause),
+            rule3_min_utterance_length=300)
+        _model_cache[key] = recognizer
+    return "sherpa", recognizer
+
+
+def prepare_moonshine(status):
+    if not HAVE_MOONSHINE:
+        raise RuntimeError("Moonshine is not installed (pip install useful-moonshine-onnx).")
+    size = config.get("Moonshine", "model", fallback=DEFAULT_MOONSHINE_MODEL)
+    if size not in MOONSHINE_MODELS:
+        size = DEFAULT_MOONSHINE_MODEL
+    key = ("moonshine", size)
+    cached = _model_cache.get(key)
+    if cached is None:
+        status(f"Loading {size} (first use downloads the model)...")
+        import moonshine_onnx
+        model = moonshine_onnx.MoonshineOnnxModel(model_name=size)
+        tokenizer = moonshine_onnx.load_tokenizer()
+        cached = (model, tokenizer)
+        _model_cache[key] = cached
+    ms_model, ms_tokenizer = cached
+
+    def recognize(seg, rate):
+        audio = resample_to_16k(seg, rate)
+        tokens = ms_model.generate(audio[np.newaxis, :].astype(np.float32))
+        return ms_tokenizer.decode_batch(tokens)[0].strip()
+    return "segment", recognize
+
+
+def prepare_google_web(status):
+    if not HAVE_SR:
+        raise RuntimeError("SpeechRecognition is not installed (pip install SpeechRecognition).")
+    language = config.get("GoogleWeb", "language", fallback="en-US").strip() or "en-US"
+    recognizer = sr_lib.Recognizer()
+
+    def recognize(seg, rate):
+        pcm = float_to_int16_bytes(seg)
+        audio_data = sr_lib.AudioData(pcm, rate, 2)
+        try:
+            return recognizer.recognize_google(audio_data, language=language).strip()
+        except sr_lib.UnknownValueError:
+            return ""
+    return "segment", recognize
+
+
+def prepare_whisper(status):
+    backend = config.get("Whisper", "backend", fallback="faster-whisper")
+    size = config.get("Whisper", "model_size", fallback=DEFAULT_WHISPER_SIZE).strip() or DEFAULT_WHISPER_SIZE
+    lang = config.get("Whisper", "language", fallback="auto").strip().lower()
+    lang = None if lang in ("", "auto") else lang
+
+    if backend == "faster-whisper":
+        if not HAVE_FASTER_WHISPER:
+            raise RuntimeError("faster-whisper is not installed (pip install faster-whisper).")
+        # Any name faster-whisper understands is allowed, including Hugging
+        # Face CTranslate2 repo ids - this is how future models stay usable.
+        device = config.get("Whisper", "device", fallback="auto")
+        compute = config.get("Whisper", "compute_type", fallback="auto")
+        compute = "default" if compute == "auto" else compute
+        vad = config.getboolean("Whisper", "vad_filter", fallback=True)
+        key = ("fw", size, device, compute)
+        model = _model_cache.get(key)
+        if model is None:
+            status(f"Loading faster-whisper '{size}' (first use downloads the model)...")
+            model = FasterWhisperModel(size, device=device, compute_type=compute)
+            if device == "auto":
+                # CTranslate2 picks CUDA whenever a GPU is visible, even on
+                # machines without the CUDA libraries installed - verify with
+                # a tiny warm-up and drop to CPU if that blows up.
+                try:
+                    warm_segments, _ = model.transcribe(
+                        np.zeros(1600, dtype=np.float32), language="en", beam_size=1)
+                    list(warm_segments)
+                except Exception:
+                    status("GPU libraries missing - using CPU for faster-whisper...")
+                    model = FasterWhisperModel(size, device="cpu", compute_type=compute)
+            _model_cache[key] = model
+
+        def recognize(seg, rate):
+            audio = resample_to_16k(seg, rate)
+            segments, _info = model.transcribe(
+                audio, language=lang, vad_filter=vad, beam_size=1,
+                condition_on_previous_text=False)
+            return " ".join(s.text.strip() for s in segments).strip()
+        return "segment", recognize
+
+    if backend == "openai-whisper":
+        if not HAVE_OPENAI_WHISPER:
+            raise RuntimeError("openai-whisper is not installed (pip install openai-whisper).")
+        if size not in OPENAI_WHISPER_SIZES:
+            size = DEFAULT_WHISPER_SIZE
+        key = ("ow", size)
+        model = _model_cache.get(key)
+        if model is None:
+            status(f"Loading Whisper '{size}' (first use downloads the model)...")
+            model = openai_whisper.load_model(size)
+            _model_cache[key] = model
+        use_fp16 = str(getattr(model, "device", "cpu")) != "cpu"
+
+        def recognize(seg, rate):
+            audio = resample_to_16k(seg, rate)
+            result = model.transcribe(audio, language=lang, fp16=use_fp16)
+            return result.get("text", "").strip()
+        return "segment", recognize
+
+    raise RuntimeError(f"Unknown Whisper backend '{backend}'. Check Settings > Whisper.")
+
+
+def prepare_google_cloud(status):
+    if not HAVE_SR:
+        raise RuntimeError("SpeechRecognition is not installed (pip install SpeechRecognition google-cloud-speech).")
+    creds_path = config.get("Engine", "google_cloud_credentials_json", fallback="")
+    if not creds_path:
+        raise RuntimeError("Google Cloud selected, but no credentials JSON is set (Settings > Online).")
+    if not os.path.isabs(creds_path):
+        creds_path = os.path.join(get_base_path(), creds_path)
+    if not os.path.exists(creds_path):
+        raise RuntimeError(f"Google Cloud credentials file not found:\n{creds_path}")
+    with open(creds_path, "r", encoding="utf-8") as f:
+        creds = f.read()
+    recognizer = sr_lib.Recognizer()
+
+    def recognize(seg, rate):
+        pcm = float_to_int16_bytes(seg)
+        audio_data = sr_lib.AudioData(pcm, rate, 2)
+        try:
+            return recognizer.recognize_google_cloud(audio_data, credentials_json=creds).strip()
+        except sr_lib.UnknownValueError:
+            return ""
+    return "segment", recognize
+
+
+def validate_vosk():
+    _path, err = resolve_vosk_model_path()
+    return err
+
+
+def validate_sherpa():
+    _path, err = resolve_sherpa_model_dir()
+    return err
+
+
+def validate_whisper():
+    backend = config.get("Whisper", "backend", fallback="faster-whisper")
+    if backend == "faster-whisper" and not HAVE_FASTER_WHISPER:
+        return "faster-whisper is not installed.\n\npip install faster-whisper"
+    if backend == "openai-whisper" and not HAVE_OPENAI_WHISPER:
+        return "openai-whisper is not installed.\n\npip install openai-whisper"
+    return None
+
+
+def validate_google_cloud():
+    creds = config.get("Engine", "google_cloud_credentials_json", fallback="")
+    if not creds:
+        return "Google Cloud needs a credentials JSON file (Settings > Online)."
+    if not os.path.isabs(creds):
+        creds = os.path.join(get_base_path(), creds)
+    if not os.path.exists(creds):
+        return f"Google Cloud credentials file not found:\n{creds}"
+    return None
+
+
+def _validate_none():
+    return None
+
+
+ENGINES = {
+    "vosk": {
+        "label": "Vosk",
+        "title": "Vosk (offline)",
+        "desc": "True streaming - words appear live. Light on resources.",
+        "hint": "Vosk: streaming with live partial results.",
+        "available": lambda: HAVE_VOSK,
+        "install": "pip install vosk",
+        "validate": validate_vosk,
+        "prepare": prepare_vosk,
+    },
+    "sherpa": {
+        "label": "Sherpa (streaming)",
+        "title": "Sherpa streaming (offline)",
+        "desc": "Modern streaming Zipformer models - live partials like Vosk, better accuracy.",
+        "hint": "Sherpa: streaming with live partials; newer models than Vosk.",
+        "available": lambda: HAVE_SHERPA,
+        "install": "pip install sherpa-onnx",
+        "validate": validate_sherpa,
+        "prepare": prepare_sherpa,
+    },
+    "whisper": {
+        "label": "Whisper",
+        "title": "Whisper (offline)",
+        "desc": "Best accuracy, phrase by phrase. faster-whisper backend recommended.",
+        "hint": "Whisper: best accuracy; transcribes phrase by phrase.",
+        "available": lambda: HAVE_FASTER_WHISPER or HAVE_OPENAI_WHISPER,
+        "install": "pip install faster-whisper",
+        "validate": validate_whisper,
+        "prepare": prepare_whisper,
+    },
+    "moonshine": {
+        "label": "Moonshine",
+        "title": "Moonshine (offline)",
+        "desc": "New fast English model built for live captions; phrase by phrase.",
+        "hint": "Moonshine: fast local English model; phrase by phrase.",
+        "available": lambda: HAVE_MOONSHINE,
+        "install": "pip install useful-moonshine-onnx",
+        "validate": _validate_none,
+        "prepare": prepare_moonshine,
+    },
+    "google_web": {
+        "label": "Google Web (free)",
+        "title": "Google Web Speech (online)",
+        "desc": "Free, no key or setup needed. Sends audio to Google.",
+        "hint": "Google Web Speech: free online, no key needed.",
+        "available": lambda: HAVE_SR,
+        "install": "pip install SpeechRecognition",
+        "validate": _validate_none,
+        "prepare": prepare_google_web,
+    },
+    "google_cloud": {
+        "label": "Google Cloud",
+        "title": "Google Cloud (online)",
+        "desc": "Requires a credentials JSON file. Sends audio to Google.",
+        "hint": "Google Cloud: online; needs credentials in Settings.",
+        "available": lambda: HAVE_SR,
+        "install": "pip install SpeechRecognition google-cloud-speech",
+        "validate": validate_google_cloud,
+        "prepare": prepare_google_cloud,
+    },
+}
+
+ENGINE_LABELS = {key: spec["label"] for key, spec in ENGINES.items()}
+
+
+# --- Transcription session ----------------------------------------------------
+class TranscriptionSession:
+    """Owns the audio stream and worker threads for one start/stop cycle."""
+
+    def __init__(self, out_q, sources):
+        self.out = out_q
+        # sources: list of (kind, index, name) descriptors. The first is the
+        # clock master; any others are resampled and summed into it.
+        self.sources = sources if isinstance(sources, list) else [sources]
+        self.stop_event = threading.Event()
+        self.audio_q = queue.Queue()
+        self.seg_q = queue.Queue()
+        self.thread = None
+        self.recog_thread = None
+        self.samplerate = 16000
+        self.engine = "vosk"
+        self._sd_streams = []
+        self._pa = None
+        self._pa_streams = []
+        self._mix_lock = threading.Lock()
+        self._mix_bufs = []  # one ring buffer per secondary source
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="TranscribeSession", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def is_running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    # -- audio capture --
+    @staticmethod
+    def _to_mono(indata):
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            return indata.mean(axis=1)
+        return indata[:, 0] if indata.ndim > 1 else indata
+
+    def _resolve_sd_device(self, index, name):
+        """Return (index, info) for the device, re-scanning by name if the
+        index went stale (device lists renumber when drivers restart)."""
+        try:
+            info = sd.query_devices(index)
+            if info.get("name") == name and info.get("max_input_channels", 0) > 0:
+                return index, info
+        except Exception:
+            pass
+        refresh_portaudio()
+        candidates = []
+        try:
+            apis = sd.query_hostapis()
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_input_channels", 0) > 0 and d.get("name") == name:
+                    candidates.append((i, d, apis[d["hostapi"]]["name"]))
+        except Exception:
+            pass
+        for i, d, api in candidates:
+            if "WASAPI" in api:
+                return i, d
+        if candidates:
+            return candidates[0][0], candidates[0][1]
+        raise RuntimeError(f"Audio source '{name}' is no longer available.\n"
+                           "Press the refresh button and pick a source again.")
+
+    def _open_sd_stream(self, index, name, callback):
+        """Open a sounddevice input, walking a fallback cascade of sample
+        rates and channel counts. Returns (samplerate, device_info).
+
+        If the whole cascade fails, PortAudio is re-initialized and the
+        cascade retried once: Windows device state gets wedged (GoXLR
+        utility restarts, the loopback library's own PortAudio instance)
+        and a fresh init reliably clears it.
+        """
+        last_err = None
+        for attempt in range(2):
+            index, info = self._resolve_sd_device(index, name)
+            sr = int(info.get("default_samplerate") or 0) or 48000
+            max_ch = max(1, int(info.get("max_input_channels") or 1))
+            is_wasapi = False
+            try:
+                is_wasapi = "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]
+            except Exception:
+                pass
+            tried = set()
+            for rate, ch in [(sr, 1), (sr, min(2, max_ch)),
+                             (48000, min(2, max_ch)), (44100, min(2, max_ch))]:
+                if (rate, ch) in tried:
+                    continue
+                tried.add((rate, ch))
+                try:
+                    extra = sd.WasapiSettings(auto_convert=True) if is_wasapi else None
+                    stream = sd.InputStream(
+                        samplerate=rate, device=index, channels=ch, dtype="float32",
+                        blocksize=max(256, int(rate * 0.1)), callback=callback,
+                        extra_settings=extra)
+                    stream.start()
+                    self._sd_streams.append(stream)
+                    return rate, info
+                except Exception as e:
+                    last_err = e
+            if attempt == 0:
+                refresh_portaudio()
+        raise RuntimeError(f"Could not open audio source '{name}':\n{last_err}\n\n"
+                           "Press the refresh button and try again, or pick another source.")
+
+    def _open_loopback_stream(self, index, name, on_chunk):
+        """Open a WASAPI loopback capture via pyaudiowpatch. on_chunk receives
+        (mono_float32, samplerate). Returns (samplerate, device_info)."""
+        if not HAVE_LOOPBACK:
+            raise RuntimeError("System-audio capture needs the PyAudioWPatch package\n(pip install PyAudioWPatch).")
+        if self._pa is None:
+            self._pa = pyaudio_patch.PyAudio()
+        dev = None
+        try:
+            cand = self._pa.get_device_info_by_index(index)
+            if cand.get("name") == name and cand.get("isLoopbackDevice"):
+                dev = cand
+        except Exception:
+            pass
+        if dev is None:  # index went stale - find it by name
+            for d in self._pa.get_loopback_device_info_generator():
+                if d["name"] == name:
+                    dev = d
+                    break
+        if dev is None:
+            raise RuntimeError(f"System-audio source '{name}' is no longer available.\n"
+                               "Press the refresh button and pick a source again.")
+        rate = int(dev.get("defaultSampleRate") or 0) or 48000
+        ch = max(1, int(dev.get("maxInputChannels") or 2))
+
+        def cb(in_data, frame_count, time_info, status_flags):
+            if not self.stop_event.is_set():
+                pcm = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                if ch > 1:
+                    pcm = pcm.reshape(-1, ch).mean(axis=1)
+                on_chunk(pcm, rate)
+            return (None, pyaudio_patch.paContinue)
+
+        stream = self._pa.open(format=pyaudio_patch.paInt16, channels=ch, rate=rate,
+                               frames_per_buffer=max(256, int(rate * 0.1)), input=True,
+                               input_device_index=int(dev["index"]), stream_callback=cb)
+        self._pa_streams.append(stream)
+        return rate, dev
+
+    def _master_push(self, mono):
+        """Sum every secondary ring buffer into this master chunk, then enqueue.
+
+        Secondary buffers are already resampled to the master rate, so this is
+        a sample-aligned add of whatever each one has buffered so far.
+        """
+        mono = np.array(mono, dtype=np.float32, copy=True)
+        if self._mix_bufs:
+            with self._mix_lock:
+                for i, buf in enumerate(self._mix_bufs):
+                    take = min(len(mono), len(buf))
+                    if take:
+                        mono[:take] += buf[:take]
+                        self._mix_bufs[i] = buf[take:]
+            np.clip(mono, -1.0, 1.0, out=mono)
+        self.audio_q.put(mono)
+
+    def _make_secondary_sink(self, slot, master_rate):
+        max_buf = master_rate * 2  # cap backlog at 2 seconds
+
+        def sink(pcm, rate):
+            pcm = resample_audio(pcm, rate, master_rate)
+            with self._mix_lock:
+                self._mix_bufs[slot] = np.concatenate((self._mix_bufs[slot], pcm))
+                if len(self._mix_bufs[slot]) > max_buf:
+                    self._mix_bufs[slot] = self._mix_bufs[slot][-max_buf:]
+        return sink
+
+    @staticmethod
+    def _clean_loop_name(name):
+        return name.replace(" [Loopback]", "")
+
+    def _open_master(self, desc):
+        """Open the clock-master source; sets self.samplerate; returns a label."""
+        kind, index, name = desc
+        if kind == "sd":
+            def cb(indata, frames, time_info, status_flags):
+                if not self.stop_event.is_set():
+                    self._master_push(self._to_mono(indata))
+            rate, info = self._open_sd_stream(index, name, cb)
+            self.samplerate = rate
+            return info["name"]
+        if kind == "loopback":
+            rate, dev = self._open_loopback_stream(
+                index, name, lambda pcm, _r: self._master_push(pcm))
+            self.samplerate = rate
+            return f"System audio: {self._clean_loop_name(dev['name'])}"
+        raise RuntimeError(f"Unknown audio source type '{kind}'.")
+
+    def _open_secondary(self, desc, sink):
+        """Open an extra source feeding sink(mono_float32, native_rate)."""
+        kind, index, name = desc
+        if kind == "sd":
+            # The sd callback delivers audio at this device's own rate; seed
+            # the box with the master rate so the rare chunk that fires before
+            # the open returns is still resampled sensibly.
+            rate_box = [self.samplerate]
+
+            def cb(indata, frames, time_info, status_flags):
+                if not self.stop_event.is_set():
+                    sink(np.asarray(self._to_mono(indata), dtype=np.float32), rate_box[0])
+            rate, info = self._open_sd_stream(index, name, cb)
+            rate_box[0] = rate
+            return info["name"]
+        if kind == "loopback":
+            _rate, dev = self._open_loopback_stream(index, name, sink)
+            return f"System audio: {self._clean_loop_name(dev['name'])}"
+        raise RuntimeError(f"Unknown audio source type '{kind}'.")
+
+    def _expand_default_mix(self):
+        """Resolve the legacy 'default mic + default system audio' shortcut
+        into two concrete descriptors."""
+        if not HAVE_LOOPBACK:
+            raise RuntimeError("Mic + System audio needs the PyAudioWPatch package\n(pip install PyAudioWPatch).")
+        try:
+            mic_index = sd.default.device[0]
+            mic_name = sd.query_devices(mic_index)["name"]
+        except Exception:
+            raise RuntimeError("No default microphone found for the mic + system mix.")
+        if self._pa is None:
+            self._pa = pyaudio_patch.PyAudio()
+        loop = None
+        try:
+            wasapi = self._pa.get_host_api_info_by_type(pyaudio_patch.paWASAPI)
+            spk = self._pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+            for d in self._pa.get_loopback_device_info_generator():
+                if spk["name"] in d["name"]:
+                    loop = d
+                    break
+        except Exception:
+            pass
+        if loop is None:
+            loop = next(self._pa.get_loopback_device_info_generator(), None)
+        if loop is None:
+            raise RuntimeError("No system-audio loopback device found.")
+        return [("sd", mic_index, mic_name),
+                ("loopback", int(loop["index"]), loop["name"])]
+
+    def _start_capture(self):
+        """Open all selected sources (mixing extras into the first). Sets
+        self.samplerate and returns a display name for the status bar."""
+        # Flatten, expanding any 'mix' shortcut, then drop duplicate sources.
+        flat = []
+        for d in self.sources:
+            if d[0] == "mix":
+                flat.extend(self._expand_default_mix())
+            else:
+                flat.append(d)
+        seen, sources = set(), []
+        for d in flat:
+            key = (d[0], d[1], d[2])
+            if key not in seen:
+                seen.add(key)
+                sources.append(d)
+        if not sources:
+            raise RuntimeError("No audio source selected.")
+
+        names = [self._open_master(sources[0])]
+        for desc in sources[1:]:
+            self._mix_bufs.append(np.zeros(0, dtype=np.float32))
+            sink = self._make_secondary_sink(len(self._mix_bufs) - 1, self.samplerate)
+            names.append(self._open_secondary(desc, sink))
+        return " + ".join(names)
+
+    def _stop_capture(self):
+        for s in self._sd_streams:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
+        self._sd_streams = []
+        for s in self._pa_streams:
+            try:
+                s.stop_stream()
+                s.close()
+            except Exception:
+                pass
+        self._pa_streams = []
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+
+    # -- main session thread --
+    def _run(self):
+        log_file = None
+        try:
+            self.engine = config.get("Engine", "type", fallback="vosk")
+            mode, payload = self._prepare_engine(self.engine)
+            if self.stop_event.is_set():
+                return
+
+            source_name = self._start_capture()
+
+            log_file = self._open_log()
+            self.out.put(("started", None))
+            self.out.put(("status", f"Listening on: {source_name}"))
+
+            if (config.getboolean("Speakers", "enabled", fallback=True)
+                    and HAVE_SHERPA and not os.path.exists(speaker_model_path())):
+                self.out.put(("error", "Speaker labels are enabled but the speaker model isn't downloaded (Settings > Speakers)."))
+
+            if mode == "vosk":
+                rec = vosk.KaldiRecognizer(payload, self.samplerate)
+                self._vosk_loop(rec, log_file)
+            elif mode == "sherpa":
+                self._sherpa_loop(payload, log_file)
+            else:
+                self.recog_thread = threading.Thread(
+                    target=self._recognize_loop, args=(payload, log_file),
+                    name="Recognizer", daemon=True)
+                self.recog_thread.start()
+                self._vad_loop()
+                self.recog_thread.join(timeout=20)
+        except sd.PortAudioError as e:
+            self.out.put(("fatal", f"Audio device error: {e}\n\nTry another audio source or click the refresh button."))
         except Exception as e:
-             # Catch potential errors during GUI update itself
-             print(f"Error processing GUI message queue: {e}")
+            self.out.put(("fatal", f"{type(e).__name__}: {e}"))
         finally:
-            # Reschedule this check function to run again after 100ms
-            self.root.after(100, self.check_gui_queue)
-
-    def update_transcript(self, text):
-        """Appends a line of text to the transcript display area."""
-        try:
-            self.transcript_area.config(state=tk.NORMAL) # Enable editing
-            self.transcript_area.insert(tk.END, text + "\n") # Append text and newline
-            self.transcript_area.see(tk.END) # Ensure the new text is visible (auto-scroll)
-            self.transcript_area.config(state=tk.DISABLED) # Disable editing
-        except Exception as e:
-             print(f"Error updating transcript display widget: {e}")
-             self.status_var.set("Error: Failed to update transcript display.")
-
-
-    def start_transcription(self):
-        """Initiates the audio acquisition and transcription process."""
-        global sr_recognizer, sr_microphone, sr_audio_source, sr_background_listener_stop_func
-        global sd_stream, vosk_worker_thread # Vosk specific handles
-        global is_running, current_vosk_model_path, google_creds_json, selected_device_index, current_whisper_size
-
-        if is_running:
-            messagebox.showwarning("System Busy", "Transcription process is already active.")
-            return
-
-        # --- Validate Device Selection ---
-        selected_device_display_name = self.device_var.get()
-        if not selected_device_display_name or selected_device_display_name == "No audio sources detected":
-            messagebox.showerror("Configuration Error", "A valid audio source must be selected.")
-            return
-        try:
-            # MODIFICATION: Get index from the self.devices dictionary using the display name
-            selected_device_index = self.devices.get(selected_device_display_name)
-            if selected_device_index is None:
-                # This shouldn't happen if the combobox is populated correctly
-                raise ValueError(f"Selected device '{selected_device_display_name}' not found in internal list.")
-            print(f"Selected audio source: '{selected_device_display_name}' (Index: {selected_device_index})")
-
-        except Exception as e: # Catch potential errors during index lookup
-             messagebox.showerror("Device Error", f"Could not get device index for '{selected_device_display_name}':\n{e}")
-             return
-
-        # --- Load Engine Configuration ---
-        engine_type = config.get('Engine', 'type', fallback='vosk')
-        base_app_path = get_base_path()
-        google_creds_json = None # Reset
-        current_vosk_model_path = None # Reset
-        current_whisper_size = None # Reset
-
-        try:
-            # --- Validate Engine Specific Config ---
-            if engine_type == 'vosk':
-                custom_model_path_str = config.get('Paths', 'custom_model_path', fallback='')
-                preferred_type = config.get('Models', 'preferred_vosk_model_type', fallback=DEFAULT_VOSK_MODEL_TYPE)
-                if preferred_type == 'custom' and custom_model_path_str:
-                    if not os.path.isabs(custom_model_path_str): custom_model_path = os.path.join(base_app_path, custom_model_path_str)
-                    else: custom_model_path = custom_model_path_str
-                    if not os.path.exists(custom_model_path): raise FileNotFoundError(f"Custom Vosk model path specified in Settings ('{custom_model_path}') not found.")
-                    current_vosk_model_path = custom_model_path
-                elif preferred_type in MODEL_INFO:
-                    model_details = MODEL_INFO[preferred_type]
-                    model_dir_abs = os.path.join(base_app_path, config.get('Models', 'model_directory', fallback=MODEL_BASE_DIR))
-                    expected_path = os.path.join(model_dir_abs, model_details['extracted_dir_name'])
-                    if not os.path.exists(expected_path): raise FileNotFoundError(f"Preferred Vosk model '{preferred_type}' not found. Please download it via Settings.")
-                    current_vosk_model_path = expected_path
-                else: raise RuntimeError(f"Invalid Vosk model configuration (Type: '{preferred_type}'). Check Settings.")
-                print(f"Using Vosk model: {current_vosk_model_path}")
-                gui_queue.put(("status", f"Using Model: {os.path.basename(current_vosk_model_path)}"))
-
-            elif engine_type == 'google_cloud':
-                creds_path_str = config.get('Engine', 'google_cloud_credentials_json', fallback='')
-                if not creds_path_str: raise FileNotFoundError("Google Cloud engine selected, but no credentials JSON path specified in Settings.")
-                if not os.path.isabs(creds_path_str): creds_path = os.path.join(base_app_path, creds_path_str)
-                else: creds_path = creds_path_str
-                if not os.path.exists(creds_path): raise FileNotFoundError(f"Google Cloud credentials file not found at '{creds_path}'. Check Settings.")
+            self._stop_capture()
+            if log_file:
                 try:
-                    with open(creds_path, "r") as f: google_creds_json = f.read()
-                    print(f"Using Google Cloud credentials from: {creds_path}")
-                    gui_queue.put(("status", "Using Engine: Google Cloud (Online)"))
-                except Exception as e: raise IOError(f"Error reading Google Cloud credentials file '{creds_path}': {e}")
+                    log_file.close()
+                except Exception:
+                    pass
+            self.stop_event.set()
+            self.out.put(("stopped", None))
 
-            elif engine_type == 'whisper':
-                 current_whisper_size = config.get('Whisper', 'model_size', fallback=DEFAULT_WHISPER_SIZE)
-                 if current_whisper_size not in WHISPER_MODEL_SIZES: raise ValueError(f"Invalid Whisper model size '{current_whisper_size}' configured. Choose from {WHISPER_MODEL_SIZES}")
-                 print(f"Using Whisper model size: {current_whisper_size}")
-                 gui_queue.put(("status", f"Using Engine: Whisper {current_whisper_size} (Offline)"))
+    # -- engine setup --
+    def _prepare_engine(self, engine):
+        """Look the engine up in the ENGINES registry and build its recognizer."""
+        spec = ENGINES.get(engine)
+        if spec is None:
+            raise RuntimeError(f"Unsupported engine '{engine}' in config.")
+        return spec["prepare"](lambda msg: self.out.put(("status", msg)))
+
+    # -- logging --
+    def _open_log(self):
+        if not config.getboolean("Settings", "enable_logging", fallback=True):
+            return None
+        path = config.get("Audio", "log_file", fallback="live_transcription.log")
+        if not os.path.isabs(path):
+            path = os.path.join(get_base_path(), path)
+        try:
+            log_dir = os.path.dirname(path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            f = open(path, "a", buffering=1, encoding="utf-8")
+            self.out.put(("status", f"Logging to {path}"))
+            return f
+        except OSError as e:
+            self.out.put(("error", f"Could not open log file ({e}); logging disabled for this run."))
+            return None
+
+    def _emit_final(self, text, log_file, speaker=None):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.out.put(("final", (ts, text, speaker)))
+        if log_file:
+            try:
+                prefix = f"{speaker}: " if speaker else ""
+                log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {prefix}{text}\n")
+            except Exception:
+                pass
+
+    def _label_speaker(self, chunks):
+        """Label the speaker of an utterance held as a list of float32 chunks."""
+        if not chunks:
+            return None
+        try:
+            audio = np.concatenate(chunks)
+            return speaker_registry.label(resample_to_16k(audio, self.samplerate))
+        except Exception:
+            return None
+
+    # -- Vosk streaming loop --
+    def _vosk_loop(self, rec, log_file):
+        last_partial = ""
+        collect = speaker_labels_active()
+        utt, utt_len = [], 0
+        max_keep = int(self.samplerate * 30)
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.audio_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if collect:
+                utt.append(chunk)
+                utt_len += len(chunk)
+                while utt_len > max_keep and utt:
+                    utt_len -= len(utt.pop(0))
+            data = float_to_int16_bytes(chunk)
+            if rec.AcceptWaveform(data):
+                result = json.loads(rec.Result())
+                text = result.get("text", "").strip()
+                if text:
+                    speaker = self._label_speaker(utt) if collect else None
+                    self._emit_final(text, log_file, speaker)
+                utt, utt_len = [], 0
+                if last_partial:
+                    last_partial = ""
+                    self.out.put(("partial", ""))
             else:
-                raise ValueError(f"Unsupported engine type configured: '{engine_type}'")
-
-        except (FileNotFoundError, ValueError, RuntimeError, IOError) as e:
-             messagebox.showerror("Configuration Error", f"Cannot start transcription:\n{e}")
-             self.status_var.set(f"ERROR: {e}")
-             return # Stop before starting audio
-
-        # --- Reset state variables and queues before starting ---
-        stop_event.clear() # Clear termination signal
-        # Clear appropriate queue based on engine
-        if engine_type == 'vosk':
-            while not vosk_audio_queue.empty():
-                try: vosk_audio_queue.get_nowait()
-                except queue.Empty: break
-        while not gui_queue.empty(): # Always clear GUI queue
-            try: gui_queue.get_nowait()
-            except queue.Empty: break
-
-        self.status_var.set("Initiating audio stream...") # Update UI status
-
-        # --- Start Audio Input and Processing based on Engine ---
+                partial = json.loads(rec.PartialResult()).get("partial", "")
+                if partial != last_partial:
+                    last_partial = partial
+                    self.out.put(("partial", partial))
         try:
-            if engine_type == 'vosk':
-                # --- Start Vosk Audio Input (sounddevice) ---
-                # selected_device_index should be valid now from the updated list_audio_devices
-                device_info = sd.query_devices(selected_device_index)
-                samplerate = int(device_info['default_samplerate'])
-                # Handle potentially 0 sample rate for loopback devices
-                if samplerate == 0:
-                     print(f"Warning: Selected device {selected_device_index} reports 0Hz sample rate. Trying default output rate.")
-                     default_output_idx = sd.default.device[1]
-                     default_output_info = sd.query_devices(default_output_idx)
-                     samplerate = int(default_output_info['default_samplerate'])
-                     if samplerate == 0:
-                          print("Warning: Default output also 0Hz. Falling back to 48000 Hz for Vosk.")
-                          samplerate = 48000
+            text = json.loads(rec.FinalResult()).get("text", "").strip()
+            if text:
+                self._emit_final(text, log_file, self._label_speaker(utt) if collect else None)
+        except Exception:
+            pass
 
-                print(f"Attempting to open sounddevice InputStream with device={selected_device_index}, samplerate={samplerate}")
-                sd_stream = sd.InputStream(
-                    samplerate=samplerate, device=selected_device_index,
-                    channels=1, dtype='int16', # Use 1 channel for mono transcription input
-                    callback=vosk_audio_callback,
-                    blocksize=8000 # Adjust blocksize if needed
-                )
-                sd_stream.start()
-                self.status_var.set("Audio stream active (Vosk). Initializing engine...")
-                # Start Vosk worker thread
-                vosk_worker_thread = threading.Thread(target=vosk_transcription_worker, name="VoskWorker")
-                vosk_worker_thread.daemon = True
-                vosk_worker_thread.start()
+    # -- sherpa-onnx streaming loop --
+    def _sherpa_loop(self, recognizer, log_file):
+        stream = recognizer.create_stream()
+        last_partial = ""
+        collect = speaker_labels_active()
+        utt, utt_len = [], 0
+        max_keep = int(self.samplerate * 30)
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.audio_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if collect:
+                utt.append(chunk)
+                utt_len += len(chunk)
+                while utt_len > max_keep and utt:
+                    utt_len -= len(utt.pop(0))
+            stream.accept_waveform(self.samplerate, chunk)
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
+            text = recognizer.get_result(stream).strip()
+            if recognizer.is_endpoint(stream):
+                if text:
+                    speaker = self._label_speaker(utt) if collect else None
+                    self._emit_final(text, log_file, speaker)
+                recognizer.reset(stream)
+                utt, utt_len = [], 0
+                if last_partial:
+                    last_partial = ""
+                    self.out.put(("partial", ""))
+            elif text != last_partial:
+                last_partial = text
+                self.out.put(("partial", text))
+        text = recognizer.get_result(stream).strip()
+        if text:
+            self._emit_final(text, log_file, self._label_speaker(utt) if collect else None)
 
-            else: # Whisper or Google Cloud using SpeechRecognition/PyAudio
-                # --- Initialize SR Recognizer and Microphone ---
-                # NOTE: SpeechRecognition/PyAudio might have more trouble accessing
-                # WASAPI loopback devices compared to sounddevice. This might fail.
-                print(f"Attempting to use SpeechRecognition/PyAudio with device_index={selected_device_index}")
-                sr_recognizer = sr.Recognizer()
-                # Adjust energy threshold dynamically? Maybe higher for loopback?
-                sr_recognizer.energy_threshold = 400 # Start with default, adjust if needed
-                sr_recognizer.pause_threshold = 0.8 # Time of silence before phrase ends
-                # sr_recognizer.dynamic_energy_threshold = True # Let SR adjust energy
+    # -- segmenting (energy VAD) loop for Whisper / Google --
+    def _vad_loop(self):
+        sr_hz = self.samplerate
+        pause = config.getfloat("Audio", "pause_threshold", fallback=0.7)
+        max_phrase = config.getfloat("Audio", "max_phrase_sec", fallback=12.0)
+        threshold = get_energy_threshold()
+        calibrating = threshold is None
+        noise_levels = []
+        cal_time = 0.0
+        pre_roll = deque()
+        pre_roll_dur = 0.0
+        voiced = []
+        voiced_dur = 0.0
+        speech_dur = 0.0
+        silence_run = 0.0
 
-                try:
-                    # Need to handle potential errors opening the device here
-                    sr_microphone = sr.Microphone(device_index=selected_device_index)
-                except Exception as e_mic:
-                    # Catch errors specifically from Microphone() constructor
-                    print(f"Error initializing sr.Microphone with index {selected_device_index}: {e_mic}")
-                    # Try to provide a more helpful error message
-                    err_msg = f"Failed to open audio source with SpeechRecognition/PyAudio (Index: {selected_device_index}):\n{e_mic}\n\n"
-                    if "Invalid input device" in str(e_mic) or "Error opening stream" in str(e_mic) :
-                         err_msg += "This might happen with loopback devices.\nTry using the Vosk engine (which uses sounddevice) or check if 'Stereo Mix' is enabled in Windows sound settings."
-                    else:
-                         err_msg += "Ensure the selected device is available and drivers are installed."
-                    messagebox.showerror("Audio Source Error", err_msg)
-                    self.status_var.set("ERROR: Failed to open audio source.")
-                    return # Stop the start process
+        if calibrating:
+            self.out.put(("status", "Calibrating noise floor (stay quiet for a moment)..."))
 
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.audio_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            d = len(chunk) / sr_hz
+            level = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
 
-                self.status_var.set("Adjusting for ambient noise... Please wait.")
-                self.root.update_idletasks()
-                try:
-                    with sr_microphone as source:
-                        print("Adjusting for ambient noise...")
-                        sr_recognizer.adjust_for_ambient_noise(source, duration=1.0)
-                        print(f"Set minimum energy threshold to {sr_recognizer.energy_threshold:.2f}")
-                    self.status_var.set("Ambient noise adjustment complete.")
-                    sr_audio_source = sr_microphone # Store for background listener
-                except Exception as e_adjust:
-                    print(f"Error during ambient noise adjustment: {e_adjust}")
-                    messagebox.showerror("Audio Source Error", f"Failed during ambient noise adjustment:\n{e_adjust}\n\nIs the selected audio source producing sound?")
-                    self.status_var.set("ERROR: Failed noise adjustment.")
-                    return # Stop the start process
+            if calibrating:
+                noise_levels.append(level)
+                cal_time += d
+                if cal_time >= 0.6:
+                    threshold = max(float(np.median(noise_levels)) * 3.5, 0.006)
+                    calibrating = False
+                    self.out.put(("status", "Listening..."))
+                continue
 
+            if level >= threshold:
+                if not voiced:
+                    voiced.extend(pre_roll)
+                    voiced_dur += pre_roll_dur
+                    pre_roll.clear()
+                    pre_roll_dur = 0.0
+                    self.out.put(("status", "Hearing speech..."))
+                voiced.append(chunk)
+                voiced_dur += d
+                speech_dur += d
+                silence_run = 0.0
+            elif voiced:
+                voiced.append(chunk)
+                voiced_dur += d
+                silence_run += d
+                if silence_run >= pause:
+                    self._dispatch(voiced, speech_dur)
+                    voiced, voiced_dur, speech_dur, silence_run = [], 0.0, 0.0, 0.0
+            else:
+                pre_roll.append(chunk)
+                pre_roll_dur += d
+                while pre_roll_dur > 0.3 and pre_roll:
+                    old = pre_roll.popleft()
+                    pre_roll_dur -= len(old) / sr_hz
 
-                # --- Start SR Background Listening ---
-                gui_queue.put(("status", "Starting background listener..."))
-                sr_background_listener_stop_func = sr_recognizer.listen_in_background(
-                    sr_audio_source,
-                    process_audio_callback,
-                    phrase_time_limit=10 # Max duration of a phrase before processing
-                )
-                print("Background listener started.")
+            if voiced and voiced_dur >= max_phrase:
+                self._dispatch(voiced, speech_dur)
+                voiced, voiced_dur, speech_dur, silence_run = [], 0.0, 0.0, 0.0
 
-            # --- Update GUI State ---
-            self.start_button.config(state=tk.DISABLED)
-            self.stop_button.config(state=tk.NORMAL)
-            self.device_combobox.config(state=tk.DISABLED) # Disable during run
-            self.settings_button.config(state=tk.DISABLED)
-            is_running = True # Set is_running True HERE
-            self.update_transcript(f"--- Transcription Initiated (Engine: {engine_type}) ---")
-            self.status_var.set("Listening...")
+        if voiced:
+            self._dispatch(voiced, speech_dur)
 
-        except sd.PortAudioError as pae:
-             # Specific handling for sounddevice stream errors
-             print(f"Sounddevice/PortAudio Error during startup: {pae}")
-             error_detail = f"Audio Device Error: {pae}\nCheck device index '{selected_device_index}' or try another source/engine."
-             if sys.platform == 'win32' and 'Windows WASAPI' in str(pae) and 'Invalid number of channels' in str(pae):
-                  error_detail += "\n\nHint: If using loopback, ensure 'Stereo Mix' (or similar) is enabled and set as default recording device in Windows Sound settings, OR try selecting the specific output device directly."
-             messagebox.showerror("Audio Init Error", error_detail)
-             self.status_var.set("ERROR: Failed to start audio stream.")
-             is_running = False # Ensure state reflects failure
-             self.start_button.config(state=tk.NORMAL if self.devices else tk.DISABLED)
-             self.stop_button.config(state=tk.DISABLED)
-             self.device_combobox.config(state="readonly" if self.devices else tk.DISABLED)
-             self.settings_button.config(state=tk.NORMAL)
-
-        except Exception as e:
-            # Handle other errors during stream or thread initialization
-            print(f"Generic error during startup: {e}")
-            messagebox.showerror("Initialization Error", f"Failed to start transcription process:\n{e}")
-            # Attempt cleanup
-            if sd_stream and sd_stream.active: sd_stream.stop(); sd_stream.close(); sd_stream = None
-            if vosk_worker_thread and vosk_worker_thread.is_alive(): stop_event.set(); # vosk_worker_thread.join(0.5) # Don't join here
-            if sr_background_listener_stop_func: sr_background_listener_stop_func(wait_for_stop=False); sr_background_listener_stop_func = None
-            is_running = False # Ensure state reflects failure
-            # Reset GUI control states
-            self.start_button.config(state=tk.NORMAL if self.devices else tk.DISABLED)
-            self.stop_button.config(state=tk.DISABLED)
-            self.device_combobox.config(state="readonly" if self.devices else tk.DISABLED)
-            self.settings_button.config(state=tk.NORMAL)
-            self.status_var.set("System Error during startup. Verify configuration and device.")
-
-
-    # MODIFIED stop_transcription function (from previous step)
-    def stop_transcription(self):
-        """Signals termination and starts the background stop handler."""
-        global is_running, stop_handler_thread # Added stop_handler_thread global
-        if not is_running: # Ignore if already stopped
-            print("Stop ignored: Already stopped (is_running is False).")
+    def _dispatch(self, chunks, speech_dur):
+        if speech_dur < 0.3:
             return
+        self.seg_q.put(np.concatenate(chunks))
 
-        # Prevent multiple stop attempts while handler is running
-        if self.stop_button['state'] == tk.DISABLED and stop_handler_thread and stop_handler_thread.is_alive():
-            print("Stop ignored: Stop process already running.")
+    def _recognize_loop(self, recognize, log_file):
+        while True:
+            try:
+                seg = self.seg_q.get(timeout=0.25)
+            except queue.Empty:
+                if self.stop_event.is_set():
+                    break
+                continue
+            try:
+                self.out.put(("status", "Transcribing..."))
+                text = recognize(seg, self.samplerate)
+            except Exception as e:
+                self.out.put(("error", f"Recognition failed: {e}"))
+                continue
+            if text:
+                speaker = None
+                if speaker_labels_active():
+                    speaker = speaker_registry.label(resample_to_16k(seg, self.samplerate))
+                self._emit_final(text, log_file, speaker)
+            if not self.stop_event.is_set():
+                self.out.put(("status", "Listening..."))
+
+
+# --- Windows dark title bar -----------------------------------------------------
+def set_titlebar_dark(window, dark):
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (20; 19 pre-20H1)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                break
+        # Nudge the window so DWM repaints the title bar immediately.
+        try:
+            alpha = window.attributes("-alpha")
+            window.attributes("-alpha", max(0.1, float(alpha) - 0.01))
+            window.after(20, lambda: window.attributes("-alpha", alpha))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# --- GUI -------------------------------------------------------------------------
+class TranscriberApp:
+    def __init__(self, root):
+        self.root = root
+        self.session = None
+        self.settings_dialog = None
+        self.overlay_on = False
+        self._restore_topmost = False
+        self.palette = DARK
+
+        root.title(APP_TITLE)
+        root.geometry("880x560")
+        root.minsize(680, 380)
+        root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        root.bind("<Escape>", lambda e: self.exit_overlay())
+
+        self.style = ttk.Style(root)
+
+        base_family = "Segoe UI" if "Segoe UI" in tkfont.families(root) else "TkDefaultFont"
+        self.base_font = (base_family, 10)
+        self.transcript_font = tkfont.Font(
+            family=base_family,
+            size=config.getint("Settings", "font_size", fallback=11))
+        self.partial_font = tkfont.Font(
+            family=base_family,
+            size=config.getint("Settings", "font_size", fallback=11),
+            slant="italic")
+        self.speaker_font = tkfont.Font(
+            family=base_family,
+            size=config.getint("Settings", "font_size", fallback=11),
+            weight="bold")
+
+        # ---- top bar (two rows) ----
+        self.topbar = ttk.Frame(root, padding=(10, 8, 10, 4))
+        self.topbar.pack(side=tk.TOP, fill=tk.X)
+
+        row1 = ttk.Frame(self.topbar)
+        row1.pack(fill=tk.X)
+        ttk.Label(row1, text="Source:").pack(side=tk.LEFT)
+        self.devices = list_audio_devices()
+        self.device_var = tk.StringVar()
+        self.device_combo = ttk.Combobox(row1, textvariable=self.device_var,
+                                         values=list(self.devices.keys()),
+                                         state="readonly", width=40)
+        self.device_combo.pack(side=tk.LEFT, padx=(6, 2))
+        self.device_combo.bind("<<ComboboxSelected>>", self.on_device_change)
+
+        ttk.Label(row1, text="+ Mix with:").pack(side=tk.LEFT, padx=(8, 0))
+        self.mix_var = tk.StringVar()
+        self.mix_combo = ttk.Combobox(row1, textvariable=self.mix_var,
+                                      values=[NO_MIX_LABEL] + list(self.devices.keys()),
+                                      state="readonly", width=34)
+        self.mix_combo.pack(side=tk.LEFT, padx=(6, 2))
+        self.mix_combo.bind("<<ComboboxSelected>>", self.on_mix_change)
+        self.refresh_btn = ttk.Button(row1, text="⟳", width=3, command=self.refresh_devices)
+        self.refresh_btn.pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(self.topbar)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row2, text="Engine:").pack(side=tk.LEFT)
+        self.engine_var = tk.StringVar()
+        self._engine_display_to_key = {ENGINE_LABELS[k]: k for k in available_engines()}
+        self.engine_combo = ttk.Combobox(row2, textvariable=self.engine_var,
+                                         values=list(self._engine_display_to_key.keys()),
+                                         state="readonly", width=17)
+        self.engine_combo.pack(side=tk.LEFT, padx=(6, 10))
+        self.engine_combo.bind("<<ComboboxSelected>>", self.on_engine_change)
+
+        self.start_btn = ttk.Button(row2, text="▶ Start", style="Accent.TButton",
+                                    command=self.start_transcription)
+        self.start_btn.pack(side=tk.LEFT, padx=2)
+        self.stop_btn = ttk.Button(row2, text="■ Stop", command=self.stop_transcription,
+                                   state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+        self.settings_btn = ttk.Button(row2, text="Settings", command=self.open_settings)
+        self.settings_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.save_btn = ttk.Button(row2, text="Save transcript...", command=self.save_transcript)
+        self.save_btn.pack(side=tk.RIGHT)
+        self.clear_btn = ttk.Button(row2, text="Clear", command=self.clear_transcript)
+        self.clear_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        row3 = ttk.Frame(self.topbar)
+        row3.pack(fill=tk.X, pady=(6, 0))
+        self.theme_btn = ttk.Button(row3, text="", width=10, command=self.toggle_theme)
+        self.theme_btn.pack(side=tk.LEFT)
+
+        self.pin_var = tk.BooleanVar(value=config.getboolean("Settings", "always_on_top", fallback=False))
+        self.pin_check = ttk.Checkbutton(row3, text="\U0001F4CC Always on top",
+                                         variable=self.pin_var, command=self.apply_pin)
+        self.pin_check.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(row3, text="Opacity:").pack(side=tk.LEFT, padx=(14, 4))
+        self.opacity_var = tk.DoubleVar(value=config.getfloat("Settings", "opacity", fallback=100))
+        self.opacity_scale = ttk.Scale(row3, from_=40, to=100, length=120,
+                                       variable=self.opacity_var, command=self.on_opacity_change)
+        self.opacity_scale.pack(side=tk.LEFT)
+
+        self.overlay_btn = ttk.Button(row3, text="Overlay mode", command=self.toggle_overlay)
+        self.overlay_btn.pack(side=tk.LEFT, padx=(14, 0))
+
+        # ---- transcript body ----
+        self.body = ttk.Frame(root, padding=(10, 4, 10, 0))
+        self.body.pack(fill=tk.BOTH, expand=True)
+        self.body.rowconfigure(0, weight=1)
+        self.body.columnconfigure(0, weight=1)
+
+        self.txt = tk.Text(self.body, wrap=tk.WORD, state=tk.DISABLED,
+                           font=self.transcript_font, relief=tk.FLAT,
+                           borderwidth=0, highlightthickness=1, padx=8, pady=6)
+        self.txt.grid(row=0, column=0, sticky="nsew")
+        self.scroll = ttk.Scrollbar(self.body, orient=tk.VERTICAL, command=self.txt.yview)
+        self.scroll.grid(row=0, column=1, sticky="ns")
+        self.txt.configure(yscrollcommand=self.scroll.set)
+
+        self.partial_var = tk.StringVar(value="")
+        self.partial_label = tk.Label(self.body, textvariable=self.partial_var,
+                                      anchor="w", justify=tk.LEFT, font=self.partial_font)
+        self.partial_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+
+        # ---- status bar ----
+        self.status_var = tk.StringVar(value="Idle. Pick an audio source and press Start.")
+        self.status_bar = ttk.Label(root, textvariable=self.status_var,
+                                    style="Status.TLabel", anchor=tk.W, padding=(10, 4))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ---- initial state ----
+        self._select_initial_device()
+        self._select_initial_engine()
+        self.apply_theme(config.get("Settings", "theme", fallback="dark"))
+        self.apply_pin()
+        self.on_opacity_change(self.opacity_var.get())
+        if not available_engines():
+            self.status_var.set("No transcription engines installed. See README / requirements.txt.")
+            self.start_btn.config(state=tk.DISABLED)
+        self.root.after(80, self.pump_queue)
+
+    # ---------- device & engine selection ----------
+    def _select_initial_device(self):
+        if not self.devices:
+            self.device_var.set("No audio input devices found")
+            self.device_combo.config(state=tk.DISABLED)
+            self.mix_combo.config(state=tk.DISABLED)
+            self.start_btn.config(state=tk.DISABLED)
             return
-            # MODIFICATION START: Removed redundant check and empty return
-            # ---- Start of code block to remove ----
-        # Or if stop button is disabled for other reasons (already stopped)
-        # if self.stop_button['state'] == tk.DISABLED:
-        #    print("Stop ignored: Stop button is already disabled.") # Added print for clarity
-        #    return
-            # ---- End of code block to remove ----
-            # MODIFICATION END
+        saved = config.get("Audio", "audio_source_name", fallback="")
+        names = list(self.devices.keys())
+        if saved in names:
+            self.device_var.set(saved)
+        else:
+            default = [n for n in names if "(default)" in n]
+            self.device_var.set(default[0] if default else names[0])
+        config.set("Audio", "audio_source_name", self.device_var.get())
+        saved_mix = config.get("Audio", "mix_source_name", fallback="")
+        self.mix_var.set(saved_mix if saved_mix in names else NO_MIX_LABEL)
 
-        self.status_var.set("Stopping listener/stream...")
-        # Disable Stop button immediately to prevent multiple clicks
-        self.stop_button.config(state=tk.DISABLED)
-        # Keep Start/Settings disabled until stop is confirmed via GUI queue
-        self.start_button.config(state=tk.DISABLED)
-        self.settings_button.config(state=tk.DISABLED)
-        self.device_combobox.config(state=tk.DISABLED)
+    def _select_initial_engine(self):
+        engines = available_engines()
+        if not engines:
+            self.engine_var.set("None installed")
+            self.engine_combo.config(state=tk.DISABLED)
+            return
+        current = config.get("Engine", "type", fallback="vosk")
+        if current not in engines:
+            current = engines[0]
+            config.set("Engine", "type", current)
+        self.engine_var.set(ENGINE_LABELS[current])
 
-        stop_event.set() # Signal threads/callbacks to stop
+    def on_device_change(self, event=None):
+        name = self.device_var.get()
+        if name in self.devices:
+            config.set("Audio", "audio_source_name", name)
 
-        # Start the background thread to handle actual stopping
-        print("Starting stop handler thread...")
-        stop_handler_thread = threading.Thread(target=_perform_stop, name="StopHandler")
-        stop_handler_thread.daemon = True
-        stop_handler_thread.start()
+    def on_mix_change(self, event=None):
+        name = self.mix_var.get()
+        config.set("Audio", "mix_source_name", name if name in self.devices else "")
 
-        # Note: is_running will be set to False and GUI re-enabled
-        # via a message ("enable_controls") from the _perform_stop thread's finally block
-    # END OF MODIFIED stop_transcription function
+    def on_engine_change(self, event=None):
+        key = self._engine_display_to_key.get(self.engine_var.get())
+        if key:
+            config.set("Engine", "type", key)
+            self.status_var.set(ENGINES[key]["hint"])
 
+    def refresh_devices(self):
+        previous = self.device_var.get()
+        refresh_portaudio()  # pick up devices added/removed since startup
+        previous_mix = self.mix_var.get()
+        self.devices = list_audio_devices()
+        names = list(self.devices.keys())
+        self.device_combo.config(values=names, state="readonly" if names else tk.DISABLED)
+        self.mix_combo.config(values=[NO_MIX_LABEL] + names,
+                              state="readonly" if names else tk.DISABLED)
+        if not names:
+            self.device_var.set("No audio input devices found")
+            self.start_btn.config(state=tk.DISABLED)
+            return
+        if previous in names:
+            self.device_var.set(previous)
+        else:
+            default = [n for n in names if "(default)" in n]
+            self.device_var.set(default[0] if default else names[0])
+        config.set("Audio", "audio_source_name", self.device_var.get())
+        self.mix_var.set(previous_mix if previous_mix in names else NO_MIX_LABEL)
+        config.set("Audio", "mix_source_name",
+                   self.mix_var.get() if self.mix_var.get() in names else "")
+        if self.session is None or not self.session.is_running():
+            self.start_btn.config(state=tk.NORMAL)
+        self.status_var.set(f"Found {len(names)} audio source(s).")
 
-    def on_closing(self):
-        """Callback function executed when the main window close button is pressed."""
-        # Also ensure settings window is closed if open
-        if self.settings_window and self.settings_window.winfo_exists():
-             self.settings_window.destroy()
+    # ---------- theming ----------
+    def apply_theme(self, mode):
+        p = DARK if mode == "dark" else LIGHT
+        self.palette = p
+        config.set("Settings", "theme", mode)
+        s = self.style
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
 
-        # Save config on close
+        self.root.configure(bg=p["bg"])
+        s.configure(".", background=p["bg"], foreground=p["fg"],
+                    bordercolor=p["border"], focuscolor=p["accent"],
+                    font=self.base_font)
+        s.configure("TFrame", background=p["bg"])
+        s.configure("TLabel", background=p["bg"], foreground=p["fg"])
+        s.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
+        s.configure("Status.TLabel", background=p["surface"], foreground=p["muted"])
+
+        s.configure("TButton", background=p["control"], foreground=p["fg"],
+                    bordercolor=p["border"], padding=(10, 5), relief=tk.FLAT)
+        s.map("TButton",
+              background=[("disabled", p["bg"]), ("pressed", p["control_hover"]),
+                          ("active", p["control_hover"])],
+              foreground=[("disabled", p["muted"])])
+        s.configure("Accent.TButton", background=p["accent"], foreground=p["accent_fg"])
+        s.map("Accent.TButton",
+              background=[("disabled", p["control"]), ("pressed", p["accent_hover"]),
+                          ("active", p["accent_hover"])],
+              foreground=[("disabled", p["muted"])])
+
+        s.configure("TCheckbutton", background=p["bg"], foreground=p["fg"],
+                    indicatorcolor=p["control"])
+        s.map("TCheckbutton",
+              background=[("active", p["bg"])],
+              indicatorcolor=[("selected", p["accent"])],
+              foreground=[("disabled", p["muted"])])
+        s.configure("TRadiobutton", background=p["bg"], foreground=p["fg"],
+                    indicatorcolor=p["control"])
+        s.map("TRadiobutton",
+              background=[("active", p["bg"])],
+              indicatorcolor=[("selected", p["accent"])],
+              foreground=[("disabled", p["muted"])])
+
+        s.configure("TCombobox", fieldbackground=p["control"], background=p["control"],
+                    foreground=p["fg"], arrowcolor=p["fg"], bordercolor=p["border"],
+                    lightcolor=p["control"], darkcolor=p["control"])
+        s.map("TCombobox",
+              fieldbackground=[("readonly", p["control"]), ("disabled", p["bg"])],
+              foreground=[("disabled", p["muted"])],
+              selectbackground=[("readonly", p["control"])],
+              selectforeground=[("readonly", p["fg"])])
+        s.configure("TEntry", fieldbackground=p["control"], foreground=p["fg"],
+                    insertcolor=p["fg"], bordercolor=p["border"])
+        s.configure("TSpinbox", fieldbackground=p["control"], foreground=p["fg"],
+                    insertcolor=p["fg"], arrowcolor=p["fg"], bordercolor=p["border"])
+
+        s.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
+        s.configure("TLabelframe.Label", background=p["bg"], foreground=p["muted"])
+        s.configure("TNotebook", background=p["bg"], bordercolor=p["border"])
+        s.configure("TNotebook.Tab", background=p["control"], foreground=p["fg"],
+                    padding=(12, 6))
+        s.map("TNotebook.Tab",
+              background=[("selected", p["bg"])],
+              foreground=[("selected", p["accent"])])
+        s.configure("Horizontal.TScale", background=p["bg"], troughcolor=p["control"])
+        s.configure("Vertical.TScrollbar", background=p["control"], troughcolor=p["bg"],
+                    bordercolor=p["bg"], arrowcolor=p["muted"])
+        s.map("Vertical.TScrollbar", background=[("active", p["control_hover"])])
+
+        # Combobox dropdown list (plain tk listbox inside the popdown).
+        self.root.option_add("*TCombobox*Listbox.background", p["surface"])
+        self.root.option_add("*TCombobox*Listbox.foreground", p["fg"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", p["sel_bg"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", p["fg"])
+
+        self.txt.configure(bg=p["text_bg"], fg=p["text_fg"], insertbackground=p["fg"],
+                           selectbackground=p["sel_bg"], selectforeground=p["fg"],
+                           highlightbackground=p["border"], highlightcolor=p["border"])
+        self.txt.tag_configure("ts", foreground=p["muted"])
+        self.txt.tag_configure("info", foreground=p["accent"], font=self.partial_font)
+        self.txt.tag_configure("warn", foreground=p["danger"])
+        for i, colour in enumerate(p["speakers"]):
+            self.txt.tag_configure(f"spk{i}", foreground=colour, font=self.speaker_font)
+        self.partial_label.configure(bg=p["bg"], fg=p["muted"])
+
+        self.theme_btn.config(text="☀ Light" if mode == "dark" else "\U0001F319 Dark")
+        set_titlebar_dark(self.root, mode == "dark")
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.configure(bg=p["bg"])
+            set_titlebar_dark(self.settings_dialog, mode == "dark")
+
+    def toggle_theme(self):
+        mode = "light" if config.get("Settings", "theme", fallback="dark") == "dark" else "dark"
+        self.apply_theme(mode)
         save_config()
 
-        if is_running: # Check if transcription is active
-            print("Close requested while running. Stopping transcription...")
-            self.stop_transcription() # Initiate graceful shutdown
-            # Schedule window destruction shortly after to allow cleanup
-            self.root.after(500, self.root.destroy)
+    def set_font_size(self, size):
+        config.set("Settings", "font_size", str(size))
+        self.transcript_font.configure(size=size)
+        self.partial_font.configure(size=size)
+        self.speaker_font.configure(size=size)
+
+    # ---------- transparency / pin / overlay ----------
+    def on_opacity_change(self, value):
+        try:
+            v = max(40.0, min(100.0, float(value)))
+        except (TypeError, ValueError):
+            v = 100.0
+        if not self.overlay_on:
+            self.root.attributes("-alpha", v / 100.0)
+        config.set("Settings", "opacity", f"{v:.0f}")
+
+    def apply_pin(self):
+        on = bool(self.pin_var.get())
+        self.root.attributes("-topmost", on)
+        config.set("Settings", "always_on_top", str(on))
+
+    def toggle_overlay(self):
+        if self.overlay_on:
+            self.exit_overlay()
+            return
+        self.overlay_on = True
+        self._restore_topmost = bool(self.pin_var.get())
+        self.topbar.pack_forget()
+        self.status_bar.pack_forget()
+        self.root.attributes("-topmost", True)
+        overlay_alpha = config.getfloat("Settings", "overlay_opacity", fallback=85) / 100.0
+        self.root.attributes("-alpha", max(0.3, min(1.0, overlay_alpha)))
+        self.partial_var.set("Overlay mode - press Esc to restore controls")
+
+    def exit_overlay(self):
+        if not self.overlay_on:
+            return
+        self.overlay_on = False
+        self.topbar.pack(side=tk.TOP, fill=tk.X, before=self.body)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.root.attributes("-topmost", self._restore_topmost)
+        self.on_opacity_change(self.opacity_var.get())
+        if self.partial_var.get().startswith("Overlay mode"):
+            self.partial_var.set("")
+
+    # ---------- transcript helpers ----------
+    def append_final(self, ts, text, speaker=None):
+        self.txt.configure(state=tk.NORMAL)
+        self.txt.insert(tk.END, f"[{ts}] ", "ts")
+        if speaker:
+            try:
+                idx = (int(speaker.split()[-1]) - 1) % len(self.palette["speakers"])
+            except (ValueError, IndexError):
+                idx = 0
+            self.txt.insert(tk.END, f"{speaker}: ", f"spk{idx}")
+        self.txt.insert(tk.END, text + "\n")
+        self.txt.see(tk.END)
+        self.txt.configure(state=tk.DISABLED)
+
+    def append_info(self, text, tag="info"):
+        self.txt.configure(state=tk.NORMAL)
+        self.txt.insert(tk.END, text + "\n", tag)
+        self.txt.see(tk.END)
+        self.txt.configure(state=tk.DISABLED)
+
+    def clear_transcript(self):
+        self.txt.configure(state=tk.NORMAL)
+        self.txt.delete("1.0", tk.END)
+        self.txt.configure(state=tk.DISABLED)
+        self.partial_var.set("")
+
+    def save_transcript(self):
+        content = self.txt.get("1.0", "end-1c")
+        if not content.strip():
+            self.status_var.set("Nothing to save yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save transcript", defaultextension=".txt",
+            initialfile=f"transcript_{datetime.now():%Y%m%d_%H%M%S}.txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")], parent=self.root)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
+            self.status_var.set(f"Transcript saved to {path}")
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e), parent=self.root)
+
+    # ---------- start / stop ----------
+    def start_transcription(self):
+        if self.session is not None and self.session.is_running():
+            return
+        name = self.device_var.get()
+        desc = self.devices.get(name)
+        if desc is None:
+            messagebox.showerror("No audio source", "Select a valid audio source first.", parent=self.root)
+            return
+        sources = [desc]
+        mix_name = self.mix_var.get()
+        if mix_name in self.devices and self.devices[mix_name] != desc:
+            sources.append(self.devices[mix_name])
+        engine = config.get("Engine", "type", fallback="vosk")
+        err = self._validate_engine(engine)
+        if err:
+            messagebox.showerror("Cannot start", err, parent=self.root)
+            return
+        self._set_running_ui(True)
+        self.partial_var.set("")
+        self.status_var.set("Starting...")
+        combo = " + ".join(s[2] or "Mic+System" for s in sources)
+        self.append_info(f"--- started ({ENGINE_LABELS.get(engine, engine)} | {combo}) ---")
+        self.session = TranscriptionSession(gui_queue, sources)
+        self.session.start()
+
+    def _validate_engine(self, engine):
+        spec = ENGINES.get(engine)
+        if spec is None:
+            return f"Unknown engine '{engine}'."
+        if not spec["available"]():
+            return f"{spec['label']} is not installed.\n\n{spec['install']}"
+        return spec["validate"]()
+
+    def stop_transcription(self):
+        if self.session is None or not self.session.is_running():
+            return
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_var.set("Stopping...")
+        self.session.stop()
+
+    def _set_running_ui(self, running):
+        idle_state = tk.DISABLED if running else tk.NORMAL
+        self.start_btn.config(state=tk.DISABLED if (running or not self.devices) else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        self.device_combo.config(state=tk.DISABLED if running else ("readonly" if self.devices else tk.DISABLED))
+        self.mix_combo.config(state=tk.DISABLED if running else ("readonly" if self.devices else tk.DISABLED))
+        self.engine_combo.config(state=tk.DISABLED if running else ("readonly" if self._engine_display_to_key else tk.DISABLED))
+        self.settings_btn.config(state=idle_state)
+        self.refresh_btn.config(state=idle_state)
+
+    # ---------- queue pump ----------
+    def pump_queue(self):
+        try:
+            while True:
+                kind, payload = gui_queue.get_nowait()
+                if kind == "final":
+                    ts, text, speaker = payload
+                    self.partial_var.set("")
+                    self.append_final(ts, text, speaker)
+                elif kind == "partial":
+                    self.partial_var.set(("… " + payload) if payload else "")
+                elif kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "error":
+                    self.status_var.set(payload)
+                    self.append_info(f"⚠ {payload}", "warn")
+                elif kind == "fatal":
+                    self.partial_var.set("")
+                    if self.session is not None:
+                        self.session.stop()
+                    self.status_var.set("Error - stopped.")
+                    self.append_info(f"⚠ {payload}", "warn")
+                    messagebox.showerror("Transcription error", payload, parent=self.root)
+                elif kind == "started":
+                    pass  # UI already switched at click time
+                elif kind == "stopped":
+                    self.partial_var.set("")
+                    self._set_running_ui(False)
+                    if not self.status_var.get().startswith("Error"):
+                        self.status_var.set("Stopped. Idle.")
+                    self.append_info("--- stopped ---")
+                elif kind == "download_done":
+                    ok, label, err = payload
+                    parent = self.settings_dialog if self._settings_open() else self.root
+                    if ok:
+                        self.status_var.set(f"{label.capitalize()} downloaded and ready.")
+                        messagebox.showinfo("Download complete",
+                                            f"{label.capitalize()} is ready to use.", parent=parent)
+                    else:
+                        self.status_var.set(f"{label.capitalize()} download failed: {err}")
+                        messagebox.showerror("Download failed", err or "Unknown error", parent=parent)
+                    if self._settings_open():
+                        self.settings_dialog.on_download_finished()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"GUI queue error: {e}")
+        finally:
+            self.root.after(80, self.pump_queue)
+
+    def _settings_open(self):
+        return self.settings_dialog is not None and self.settings_dialog.winfo_exists()
+
+    # ---------- settings ----------
+    def open_settings(self):
+        if self._settings_open():
+            self.settings_dialog.lift()
+            return
+        self.settings_dialog = SettingsDialog(self)
+
+    def start_vosk_download(self, key):
+        threading.Thread(target=download_vosk_model, args=(key, gui_queue),
+                         name="VoskDownload", daemon=True).start()
+
+    def start_sherpa_download(self, key):
+        threading.Thread(target=download_sherpa_model, args=(key, gui_queue),
+                         name="SherpaDownload", daemon=True).start()
+
+    def start_speaker_download(self):
+        threading.Thread(target=download_speaker_model, args=(gui_queue,),
+                         name="SpeakerDownload", daemon=True).start()
+
+    # ---------- closing ----------
+    def on_closing(self):
+        if self._settings_open():
+            self.settings_dialog.destroy()
+        save_config()
+        if self.session is not None and self.session.is_running():
+            self.session.stop()
+            self.root.after(600, self.root.destroy)
         else:
-            # If not running, destroy the window immediately
             self.root.destroy()
 
-    # --- Settings Window Logic ---
-    def open_settings_window(self):
-        """Creates and displays the Toplevel settings window."""
-        # Prevent opening multiple settings windows
-        if self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.lift() # Bring existing window to front
+
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        p = app.palette
+        self.title("Settings")
+        self.configure(bg=p["bg"])
+        self.minsize(620, 540)
+        self.transient(app.root)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        # ---- variables ----
+        self.engine_var = tk.StringVar(value=config.get("Engine", "type", fallback="vosk"))
+        self.vosk_model_var = tk.StringVar(value=config.get("Models", "preferred_vosk_model_type", fallback=DEFAULT_VOSK_MODEL_TYPE))
+        self.custom_path_var = tk.StringVar(value=config.get("Paths", "custom_model_path", fallback=""))
+        self.backend_var = tk.StringVar(value=config.get("Whisper", "backend", fallback="faster-whisper"))
+        self.size_var = tk.StringVar(value=config.get("Whisper", "model_size", fallback=DEFAULT_WHISPER_SIZE))
+        self.device_var = tk.StringVar(value=config.get("Whisper", "device", fallback="auto"))
+        self.compute_var = tk.StringVar(value=config.get("Whisper", "compute_type", fallback="auto"))
+        self.language_var = tk.StringVar(value=config.get("Whisper", "language", fallback="auto"))
+        self.vad_var = tk.BooleanVar(value=config.getboolean("Whisper", "vad_filter", fallback=True))
+        self.creds_var = tk.StringVar(value=config.get("Engine", "google_cloud_credentials_json", fallback=""))
+        self.sherpa_model_var = tk.StringVar(value=config.get("Sherpa", "model", fallback=DEFAULT_SHERPA_MODEL))
+        self.sherpa_custom_var = tk.StringVar(value=config.get("Sherpa", "custom_model_dir", fallback=""))
+        self.moonshine_var = tk.StringVar(value=config.get("Moonshine", "model", fallback=DEFAULT_MOONSHINE_MODEL))
+        self.gweb_lang_var = tk.StringVar(value=config.get("GoogleWeb", "language", fallback="en-US"))
+        self.spk_enabled_var = tk.BooleanVar(value=config.getboolean("Speakers", "enabled", fallback=True))
+        self.spk_threshold_var = tk.StringVar(value=config.get("Speakers", "similarity_threshold", fallback="0.45"))
+        self.spk_max_var = tk.StringVar(value=config.get("Speakers", "max_speakers", fallback="8"))
+        self.pause_var = tk.StringVar(value=config.get("Audio", "pause_threshold", fallback="0.7"))
+        self.maxphrase_var = tk.StringVar(value=config.get("Audio", "max_phrase_sec", fallback="12.0"))
+        self.energy_var = tk.StringVar(value=config.get("Audio", "energy_threshold", fallback="auto"))
+        self.logging_var = tk.BooleanVar(value=config.getboolean("Settings", "enable_logging", fallback=True))
+        self.logpath_var = tk.StringVar(value=config.get("Audio", "log_file", fallback="live_transcription.log"))
+        self.fontsize_var = tk.StringVar(value=config.get("Settings", "font_size", fallback="11"))
+        self.overlay_opacity_var = tk.DoubleVar(value=config.getfloat("Settings", "overlay_opacity", fallback=85))
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 4))
+
+        nb.add(self._build_engine_tab(nb), text="Engine")
+        nb.add(self._build_streaming_tab(nb), text="Streaming")
+        nb.add(self._build_whisper_tab(nb), text="Whisper")
+        nb.add(self._build_online_tab(nb), text="Online")
+        nb.add(self._build_speakers_tab(nb), text="Speakers")
+        nb.add(self._build_audio_tab(nb), text="Audio")
+        nb.add(self._build_appearance_tab(nb), text="Appearance")
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self.save).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+
+        set_titlebar_dark(self, config.get("Settings", "theme", fallback="dark") == "dark")
+        self.update_idletasks()
+
+    # -- tabs --
+    def _build_engine_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+        for key, spec in ENGINES.items():
+            rb = ttk.Radiobutton(tab, text=spec["title"], value=key, variable=self.engine_var)
+            rb.pack(anchor="w", pady=(6, 0))
+            desc = spec["desc"]
+            if not spec["available"]():
+                rb.config(state=tk.DISABLED)
+                desc = f"Not installed - {spec['install']}"
+            ttk.Label(tab, text="     " + desc, style="Muted.TLabel", wraplength=520,
+                      justify=tk.LEFT).pack(anchor="w")
+        return tab
+
+    def _build_streaming_tab(self, parent):
+        tab = ttk.Frame(parent, padding=10)
+
+        vosk_frame = ttk.Labelframe(tab, text="Vosk models", padding=8)
+        vosk_frame.pack(fill=tk.X, pady=(0, 8))
+        self._vosk_radios = {}
+        for key, info in MODEL_INFO.items():
+            rb = ttk.Radiobutton(vosk_frame, value=key, variable=self.vosk_model_var)
+            rb.pack(anchor="w", padx=4, pady=1)
+            self._vosk_radios[key] = rb
+        self._refresh_vosk_labels()
+        ttk.Radiobutton(vosk_frame, text="Custom model folder:", value="custom",
+                        variable=self.vosk_model_var).pack(anchor="w", padx=4, pady=(4, 1))
+        row = ttk.Frame(vosk_frame)
+        row.pack(fill=tk.X, padx=4)
+        ttk.Entry(row, textvariable=self.custom_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="Browse...", command=self._browse_custom).pack(side=tk.LEFT, padx=(6, 0))
+        self.vosk_download_btn = ttk.Button(vosk_frame, text="Download selected Vosk model",
+                                            command=self._download_selected)
+        self.vosk_download_btn.pack(anchor="w", padx=4, pady=(6, 2))
+        ttk.Label(vosk_frame, text="More languages: alphacephei.com/vosk/models",
+                  style="Muted.TLabel").pack(anchor="w", padx=4)
+
+        sherpa_frame = ttk.Labelframe(tab, text="Sherpa streaming models (sherpa-onnx)", padding=8)
+        sherpa_frame.pack(fill=tk.X)
+        self._sherpa_radios = {}
+        for key, info in SHERPA_MODELS.items():
+            rb = ttk.Radiobutton(sherpa_frame, value=key, variable=self.sherpa_model_var)
+            rb.pack(anchor="w", padx=4, pady=1)
+            self._sherpa_radios[key] = rb
+        self._refresh_sherpa_labels()
+        ttk.Radiobutton(sherpa_frame, text="Custom model folder:", value="custom",
+                        variable=self.sherpa_model_var).pack(anchor="w", padx=4, pady=(4, 1))
+        row2 = ttk.Frame(sherpa_frame)
+        row2.pack(fill=tk.X, padx=4)
+        ttk.Entry(row2, textvariable=self.sherpa_custom_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row2, text="Browse...", command=self._browse_sherpa_custom).pack(side=tk.LEFT, padx=(6, 0))
+        self.sherpa_download_btn = ttk.Button(sherpa_frame, text="Download selected Sherpa model",
+                                              command=self._download_sherpa_selected)
+        self.sherpa_download_btn.pack(anchor="w", padx=4, pady=(6, 2))
+        if not HAVE_SHERPA:
+            self.sherpa_download_btn.config(state=tk.DISABLED)
+            ttk.Label(sherpa_frame, text="sherpa-onnx is not installed (pip install sherpa-onnx).",
+                      style="Muted.TLabel").pack(anchor="w", padx=4)
+
+        if not HAVE_REQUESTS:
+            for btn in (self.vosk_download_btn, self.sherpa_download_btn):
+                btn.config(state=tk.DISABLED)
+            ttk.Label(tab, text="Downloads need the 'requests' package (pip install requests).",
+                      style="Muted.TLabel").pack(anchor="w")
+        return tab
+
+    def _build_whisper_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+        tab.columnconfigure(1, weight=1)
+
+        backends = []
+        if HAVE_FASTER_WHISPER:
+            backends.append("faster-whisper")
+        if HAVE_OPENAI_WHISPER:
+            backends.append("openai-whisper")
+        ttk.Label(tab, text="Backend:").grid(row=0, column=0, sticky="w", pady=4)
+        self.backend_combo = ttk.Combobox(tab, textvariable=self.backend_var,
+                                          values=backends or ["faster-whisper"],
+                                          state="readonly" if backends else tk.DISABLED, width=20)
+        self.backend_combo.grid(row=0, column=1, sticky="w", pady=4)
+        self.backend_combo.bind("<<ComboboxSelected>>", self._on_backend_change)
+
+        ttk.Label(tab, text="Model:").grid(row=1, column=0, sticky="w", pady=4)
+        self.size_combo = ttk.Combobox(tab, textvariable=self.size_var, width=34)
+        self.size_combo.grid(row=1, column=1, sticky="w", pady=4)
+        self._on_backend_change()
+
+        ttk.Label(tab, text="Device:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Combobox(tab, textvariable=self.device_var, values=WHISPER_DEVICES,
+                     state="readonly", width=20).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(tab, text="Compute type:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Combobox(tab, textvariable=self.compute_var, values=WHISPER_COMPUTE_TYPES,
+                     state="readonly", width=20).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="(faster-whisper only; 'int8' is a good CPU default, 'float16' for GPU)",
+                  style="Muted.TLabel").grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(tab, text="Language:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Entry(tab, textvariable=self.language_var, width=22).grid(row=5, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="('auto' to detect, or a code like en, de, fr, es...)",
+                  style="Muted.TLabel").grid(row=6, column=0, columnspan=2, sticky="w")
+
+        ttk.Checkbutton(tab, text="Use built-in VAD filter (faster-whisper, recommended)",
+                        variable=self.vad_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(tab, text="Tips: 'large-v3-turbo' and 'distil-large-v3' are the newest free models -\n"
+                            "near large-v3 accuracy at several times the speed. Models download on first use.\n"
+                            "Future models: with faster-whisper you can type ANY Hugging Face CTranslate2\n"
+                            "repo id in the Model box (e.g. user/some-new-whisper-ct2).",
+                  style="Muted.TLabel", justify=tk.LEFT).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Separator(tab).grid(row=9, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Label(tab, text="Moonshine model:").grid(row=10, column=0, sticky="w", pady=4)
+        ttk.Combobox(tab, textvariable=self.moonshine_var, values=MOONSHINE_MODELS,
+                     state="readonly" if HAVE_MOONSHINE else tk.DISABLED,
+                     width=20).grid(row=10, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="(Moonshine engine - English only; 'base' is more accurate, 'tiny' is fastest.)",
+                  style="Muted.TLabel").grid(row=11, column=0, columnspan=2, sticky="w")
+        return tab
+
+    def _build_online_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+
+        web_frame = ttk.Labelframe(tab, text="Google Web Speech (free)", padding=8)
+        web_frame.pack(fill=tk.X, pady=(0, 10))
+        row0 = ttk.Frame(web_frame)
+        row0.pack(fill=tk.X)
+        ttk.Label(row0, text="Language:").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.gweb_lang_var, width=12).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(web_frame, text="A BCP-47 code such as en-US, en-GB, de-DE, fr-FR...\n"
+                                  "No key or account needed; audio is sent to Google.",
+                  style="Muted.TLabel", justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+
+        cloud_frame = ttk.Labelframe(tab, text="Google Cloud Speech-to-Text", padding=8)
+        cloud_frame.pack(fill=tk.X)
+        ttk.Label(cloud_frame, text="Credentials JSON file:").pack(anchor="w")
+        row = ttk.Frame(cloud_frame)
+        row.pack(fill=tk.X, pady=4)
+        ttk.Entry(row, textvariable=self.creds_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="Browse...", command=self._browse_creds).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(cloud_frame, text="Create a service account with Speech-to-Text access in Google Cloud Console\n"
+                                    "and download its JSON key. Note: this engine sends audio to Google.",
+                  style="Muted.TLabel", justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+        return tab
+
+    def _build_speakers_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+        tab.columnconfigure(1, weight=1)
+        ttk.Checkbutton(tab, text="Label speakers automatically (Speaker 1, Speaker 2, ...)",
+                        variable=self.spk_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.spk_status_label = ttk.Label(tab, style="Muted.TLabel")
+        self.spk_status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.spk_download_btn = ttk.Button(tab, text="Download speaker model (~28 MB)",
+                                           command=self._download_speaker_model)
+        self.spk_download_btn.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        if not (HAVE_SHERPA and HAVE_REQUESTS):
+            self.spk_download_btn.config(state=tk.DISABLED)
+        self._refresh_speaker_status()
+
+        ttk.Label(tab, text="Similarity threshold:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Spinbox(tab, from_=0.20, to=0.80, increment=0.05, textvariable=self.spk_threshold_var,
+                    width=8).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="Lower it if one person gets split into several speakers;\n"
+                            "raise it if different people get merged into one.",
+                  style="Muted.TLabel", justify=tk.LEFT).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(tab, text="Max speakers:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Spinbox(tab, from_=2, to=16, increment=1, textvariable=self.spk_max_var,
+                    width=8).grid(row=5, column=1, sticky="w", pady=4)
+
+        ttk.Button(tab, text="Reset learned speakers",
+                   command=self._reset_speakers).grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(tab, text="Works with every engine. Voices are clustered as they speak - numbering\n"
+                            "starts fresh after a reset or app restart. Needs sherpa-onnx installed.",
+                  style="Muted.TLabel", justify=tk.LEFT).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        return tab
+
+    def _build_audio_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Pause threshold (s):").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Spinbox(tab, from_=0.3, to=3.0, increment=0.1, textvariable=self.pause_var,
+                    width=8).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="Silence needed before a phrase is sent for transcription (Whisper/Google).",
+                  style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(tab, text="Max phrase length (s):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Spinbox(tab, from_=4, to=30, increment=1, textvariable=self.maxphrase_var,
+                    width=8).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(tab, text="Energy threshold:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(tab, textvariable=self.energy_var, width=10).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="'auto' calibrates from the first moment of audio, or set a fixed RMS value\n"
+                            "(e.g. 0.01). Raise it if background noise triggers false phrases.",
+                  style="Muted.TLabel", justify=tk.LEFT).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Separator(tab).grid(row=5, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Checkbutton(tab, text="Log transcripts to file", variable=self.logging_var).grid(
+            row=6, column=0, columnspan=2, sticky="w")
+        row7 = ttk.Frame(tab)
+        row7.grid(row=7, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Entry(row7, textvariable=self.logpath_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row7, text="Browse...", command=self._browse_log).pack(side=tk.LEFT, padx=(6, 0))
+        return tab
+
+    def _build_appearance_tab(self, parent):
+        tab = ttk.Frame(parent, padding=14)
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Transcript font size:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Spinbox(tab, from_=8, to=24, increment=1, textvariable=self.fontsize_var,
+                    width=6).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="Overlay mode opacity (%):").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Scale(tab, from_=30, to=100, variable=self.overlay_opacity_var,
+                  length=180).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(tab, text="Theme and window opacity are on the main toolbar.\n"
+                            "Overlay mode hides the controls, pins the window on top and applies\n"
+                            "the opacity above - press Esc to restore.",
+                  style="Muted.TLabel", justify=tk.LEFT).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        return tab
+
+    # -- tab callbacks --
+    def _on_backend_change(self, event=None):
+        fw = self.backend_var.get() == "faster-whisper"
+        sizes = FASTER_WHISPER_SIZES if fw else OPENAI_WHISPER_SIZES
+        # faster-whisper accepts any Hugging Face CTranslate2 repo id, so the
+        # box stays editable there; openai-whisper only knows fixed names.
+        self.size_combo.config(values=sizes, state="normal" if fw else "readonly")
+        if not fw and self.size_var.get() not in sizes:
+            self.size_var.set(DEFAULT_WHISPER_SIZE)
+
+    def _refresh_vosk_labels(self):
+        for key, rb in self._vosk_radios.items():
+            mark = "  ✓ downloaded" if vosk_model_downloaded(key) else ""
+            rb.config(text=f"{MODEL_INFO[key]['description']}{mark}")
+
+    def _download_selected(self):
+        key = self.vosk_model_var.get()
+        if key not in MODEL_INFO:
+            messagebox.showwarning("Pick a model", "Select one of the standard models to download.", parent=self)
+            return
+        if vosk_model_downloaded(key):
+            messagebox.showinfo("Already downloaded", f"The '{key}' model is already downloaded.", parent=self)
+            return
+        self.vosk_download_btn.config(state=tk.DISABLED, text="Downloading...")
+        self.app.start_vosk_download(key)
+
+    def _refresh_sherpa_labels(self):
+        for key, rb in self._sherpa_radios.items():
+            mark = "  ✓ downloaded" if sherpa_model_downloaded(key) else ""
+            rb.config(text=f"{SHERPA_MODELS[key]['description']}{mark}")
+
+    def _download_sherpa_selected(self):
+        key = self.sherpa_model_var.get()
+        if key not in SHERPA_MODELS:
+            messagebox.showwarning("Pick a model", "Select one of the standard models to download.", parent=self)
+            return
+        if sherpa_model_downloaded(key):
+            messagebox.showinfo("Already downloaded", f"The '{key}' model is already downloaded.", parent=self)
+            return
+        self.sherpa_download_btn.config(state=tk.DISABLED, text="Downloading...")
+        self.app.start_sherpa_download(key)
+
+    def _browse_sherpa_custom(self):
+        d = filedialog.askdirectory(title="Select sherpa-onnx model folder", parent=self)
+        if d:
+            self.sherpa_custom_var.set(d)
+            self.sherpa_model_var.set("custom")
+
+    def _refresh_speaker_status(self):
+        if not HAVE_SHERPA:
+            text = "Needs sherpa-onnx installed (pip install sherpa-onnx)."
+        elif os.path.exists(speaker_model_path()):
+            text = "Speaker model: ✓ downloaded and ready."
+            if self.spk_download_btn.winfo_exists():
+                self.spk_download_btn.config(state=tk.DISABLED)
+        else:
+            text = "Speaker model: not downloaded yet - labels stay off until it is."
+        self.spk_status_label.config(text=text)
+
+    def _download_speaker_model(self):
+        if os.path.exists(speaker_model_path()):
+            self._refresh_speaker_status()
+            return
+        self.spk_download_btn.config(state=tk.DISABLED, text="Downloading...")
+        self.app.start_speaker_download()
+
+    def _reset_speakers(self):
+        speaker_registry.reset()
+        self.app.status_var.set("Learned speakers reset - numbering starts fresh.")
+
+    def on_download_finished(self):
+        if self.vosk_download_btn.winfo_exists():
+            self.vosk_download_btn.config(state=tk.NORMAL, text="Download selected Vosk model")
+        if HAVE_SHERPA and HAVE_REQUESTS and self.sherpa_download_btn.winfo_exists():
+            self.sherpa_download_btn.config(state=tk.NORMAL, text="Download selected Sherpa model")
+        if self.spk_download_btn.winfo_exists():
+            self.spk_download_btn.config(text="Download speaker model (~28 MB)")
+            if HAVE_SHERPA and HAVE_REQUESTS and not os.path.exists(speaker_model_path()):
+                self.spk_download_btn.config(state=tk.NORMAL)
+        self._refresh_vosk_labels()
+        self._refresh_sherpa_labels()
+        self._refresh_speaker_status()
+
+    def _browse_custom(self):
+        d = filedialog.askdirectory(title="Select Vosk model folder", parent=self)
+        if d:
+            self.custom_path_var.set(d)
+            self.vosk_model_var.set("custom")
+
+    def _browse_creds(self):
+        f = filedialog.askopenfilename(title="Select Google Cloud credentials JSON",
+                                       filetypes=[("JSON files", "*.json"), ("All files", "*.*")], parent=self)
+        if f:
+            self.creds_var.set(f)
+
+    def _browse_log(self):
+        f = filedialog.asksaveasfilename(title="Select log file", defaultextension=".log",
+                                         initialfile=os.path.basename(self.logpath_var.get()) or "live_transcription.log",
+                                         filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")],
+                                         parent=self)
+        if f:
+            self.logpath_var.set(f)
+
+    # -- save --
+    def save(self):
+        engine = self.engine_var.get()
+        if engine == "vosk" and self.vosk_model_var.get() == "custom" and not self.custom_path_var.get().strip():
+            messagebox.showwarning("Missing path", "Set a custom Vosk model folder or pick a standard model.", parent=self)
+            return
+        if engine == "sherpa" and self.sherpa_model_var.get() == "custom" and not self.sherpa_custom_var.get().strip():
+            messagebox.showwarning("Missing path", "Set a custom Sherpa model folder or pick a standard model.", parent=self)
+            return
+        if engine == "google_cloud":
+            creds = self.creds_var.get().strip()
+            if not creds:
+                messagebox.showwarning("Missing credentials", "Google Cloud needs a credentials JSON file.", parent=self)
+                return
+            check = creds if os.path.isabs(creds) else os.path.join(get_base_path(), creds)
+            if not os.path.exists(check):
+                messagebox.showwarning("File not found", f"Credentials file not found:\n{check}", parent=self)
+                return
+        try:
+            pause = float(self.pause_var.get())
+            maxphrase = float(self.maxphrase_var.get())
+            fontsize = int(float(self.fontsize_var.get()))
+        except ValueError:
+            messagebox.showwarning("Invalid value", "Pause threshold, max phrase length and font size must be numbers.", parent=self)
+            return
+        energy = self.energy_var.get().strip().lower()
+        if energy not in ("", "auto"):
+            try:
+                float(energy)
+            except ValueError:
+                messagebox.showwarning("Invalid value", "Energy threshold must be 'auto' or a number (e.g. 0.01).", parent=self)
+                return
+        try:
+            spk_threshold = float(self.spk_threshold_var.get())
+            spk_max = int(float(self.spk_max_var.get()))
+        except ValueError:
+            messagebox.showwarning("Invalid value", "Speaker threshold and max speakers must be numbers.", parent=self)
             return
 
-        self.settings_window = tk.Toplevel(self.root)
-        self.settings_window.title("Settings")
-        # Remove fixed size and minsize to allow auto-sizing based on content
-        # self.settings_window.geometry("600x450") # REMOVED
-        self.settings_window.minsize(600, 550)   # Set minimum size only - Increased height
-        self.settings_window.resizable(True, True) # Allow resizing
-        self.settings_window.transient(self.root) # Keep on top of main window
-        self.settings_window.grab_set() # Make modal (disable main window interaction)
-
-        # --- Variables to hold settings ---
-        self.engine_type_var = tk.StringVar(value=config.get('Engine', 'type', fallback='vosk'))
-        self.google_creds_var = tk.StringVar(value=config.get('Engine', 'google_cloud_credentials_json', fallback=''))
-        self.preferred_vosk_model_type_var = tk.StringVar(value=config.get('Models', 'preferred_vosk_model_type', fallback=DEFAULT_VOSK_MODEL_TYPE))
-        self.custom_model_path_var = tk.StringVar(value=config.get('Paths', 'custom_model_path', fallback=''))
-        self.whisper_model_size_var = tk.StringVar(value=config.get('Whisper', 'model_size', fallback=DEFAULT_WHISPER_SIZE)) # Whisper size var
-        self.log_file_path_var = tk.StringVar(value=config.get('Audio', 'log_file', fallback='live_transcription.log'))
-        self.enable_logging_var = tk.BooleanVar(value=config.getboolean('Settings', 'enable_logging', fallback=True))
-        self.theme_var = tk.StringVar(value=config.get('Settings', 'theme', fallback='light')) # Theme variable
-
-        # Create frames for organization
-        # Use pack with expand=True, fill='both' for frames inside settings to help with resizing
-        engine_frame = ttk.LabelFrame(self.settings_window, text="Transcription Engine", padding="10")
-        engine_frame.pack(pady=5, padx=10, fill="x", expand=False)
-
-        vosk_model_frame = ttk.LabelFrame(self.settings_window, text="Vosk Model Selection (if Vosk engine selected)", padding="10")
-        vosk_model_frame.pack(pady=5, padx=10, fill="x", expand=False) # Don't expand model frame vertically
-
-        whisper_frame = ttk.LabelFrame(self.settings_window, text="Whisper Settings (if Whisper engine selected)", padding="10") # Whisper frame
-        whisper_frame.pack(pady=5, padx=10, fill="x", expand=False)
-
-        google_frame = ttk.LabelFrame(self.settings_window, text="Google Cloud Settings (if Google engine selected)", padding="10")
-        google_frame.pack(pady=5, padx=10, fill="x", expand=False)
-
-        log_frame = ttk.LabelFrame(self.settings_window, text="Logging", padding="10")
-        log_frame.pack(pady=5, padx=10, fill="x", expand=False) # Don't expand log frame vertically
-
-        theme_frame = ttk.LabelFrame(self.settings_window, text="Appearance", padding="10") # Theme frame
-        theme_frame.pack(pady=5, padx=10, fill="x", expand=False) # Don't expand theme frame vertically
-
-        button_frame = ttk.Frame(self.settings_window, padding="10")
-        button_frame.pack(pady=10, side=tk.BOTTOM) # Pack buttons at bottom
-
-        # --- Engine Frame Widgets ---
-        ttk.Label(engine_frame, text="Engine:").pack(side=tk.LEFT, padx=5)
-        vosk_rb = ttk.Radiobutton(engine_frame, text="Vosk (Offline)", variable=self.engine_type_var, value="vosk", command=self.toggle_engine_settings)
-        vosk_rb.pack(side=tk.LEFT, padx=5)
-        whisper_rb = ttk.Radiobutton(engine_frame, text="Whisper (Offline)", variable=self.engine_type_var, value="whisper", command=self.toggle_engine_settings) # Added Whisper RB
-        whisper_rb.pack(side=tk.LEFT, padx=5)
-        gcp_rb = ttk.Radiobutton(engine_frame, text="Google Cloud (Online)", variable=self.engine_type_var, value="google_cloud", command=self.toggle_engine_settings)
-        gcp_rb.pack(side=tk.LEFT, padx=5)
-
-        # --- Vosk Model Frame Widgets ---
-        ttk.Label(vosk_model_frame, text="Preferred Model:").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,5)) # Span 3 columns
-
-        row_num = 1
-        for key, info in MODEL_INFO.items():
-            rb = ttk.Radiobutton(vosk_model_frame, text=info['description'], variable=self.preferred_vosk_model_type_var, value=key)
-            rb.grid(row=row_num, column=0, columnspan=3, sticky="w", padx=5) # Span 3 columns
-            row_num += 1
-
-        self.vosk_download_button = ttk.Button(vosk_model_frame, text="Download/Set Selected", command=self.download_and_set_preferred) # Store ref
-        self.vosk_download_button.grid(row=row_num, column=0, columnspan=3, pady=(5,10))
-        row_num += 1
-
-        self.vosk_custom_rb = ttk.Radiobutton(vosk_model_frame, text="Use Custom Model Path:", variable=self.preferred_vosk_model_type_var, value="custom") # Store ref
-        self.vosk_custom_rb.grid(row=row_num, column=0, sticky="w", padx=5, pady=5)
-
-        self.vosk_custom_model_entry = ttk.Entry(vosk_model_frame, textvariable=self.custom_model_path_var, width=45) # Store ref
-        self.vosk_custom_model_entry.grid(row=row_num, column=1, padx=(0,5), pady=5, sticky="ew") # Start entry in col 1
-        self.vosk_custom_model_browse = ttk.Button(vosk_model_frame, text="Browse...", command=self.browse_custom_model_path) # Store ref
-        self.vosk_custom_model_browse.grid(row=row_num, column=2, padx=5, pady=5)
-        vosk_model_frame.columnconfigure(1, weight=1) # Make entry expand
-
-        # --- Whisper Frame Widgets ---
-        ttk.Label(whisper_frame, text="Model Size:").grid(row=0, column=0, sticky="w", pady=5, padx=5)
-        col_num = 1
-        self.whisper_rb_list = [] # Store radiobuttons to enable/disable
-        for size in WHISPER_MODEL_SIZES:
-             rb = ttk.Radiobutton(whisper_frame, text=size.capitalize(), variable=self.whisper_model_size_var, value=size)
-             rb.grid(row=0, column=col_num, sticky="w", padx=5)
-             self.whisper_rb_list.append(rb)
-             col_num += 1
-        ttk.Label(whisper_frame, text="(Model downloaded automatically on first use per size)").grid(row=1, column=0, columnspan=col_num, sticky="w", padx=5, pady=(5,0))
-
-
-        # --- Google Cloud Frame Widgets ---
-        ttk.Label(google_frame, text="Credentials JSON File:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.google_creds_entry = ttk.Entry(google_frame, textvariable=self.google_creds_var, width=50) # Store ref
-        self.google_creds_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.google_creds_browse = ttk.Button(google_frame, text="Browse...", command=self.browse_google_creds) # Store ref
-        self.google_creds_browse.grid(row=0, column=2, padx=5, pady=5)
-        google_frame.columnconfigure(1, weight=1)
-
-        # --- Log Frame Widgets ---
-        ttk.Label(log_frame, text="Log File Path:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        log_entry = ttk.Entry(log_frame, textvariable=self.log_file_path_var, width=50)
-        log_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        log_browse = ttk.Button(log_frame, text="Browse...", command=self.browse_log_path)
-        log_browse.grid(row=0, column=2, padx=5, pady=5)
-
-        log_check = ttk.Checkbutton(log_frame, text="Enable Transcription Logging", variable=self.enable_logging_var)
-        log_check.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="w")
-        log_frame.columnconfigure(1, weight=1) # Make entry expand
-
-        # --- Theme Frame Widgets --- Added
-        ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT, padx=5)
-        light_rb = ttk.Radiobutton(theme_frame, text="Light", variable=self.theme_var, value="light")
-        light_rb.pack(side=tk.LEFT, padx=5)
-        dark_rb = ttk.Radiobutton(theme_frame, text="Dark", variable=self.theme_var, value="dark")
-        dark_rb.pack(side=tk.LEFT, padx=5)
-
-
-        # --- Button Frame Widgets ---
-        save_button = ttk.Button(button_frame, text="Save Settings", command=self.save_settings_and_close)
-        save_button.pack(side=tk.LEFT, padx=10)
-        cancel_button = ttk.Button(button_frame, text="Cancel", command=self.settings_window.destroy)
-        cancel_button.pack(side=tk.LEFT, padx=10)
-
-        # Apply theme to the settings window itself
-        self.apply_theme_to_window(self.settings_window, self.theme_var.get())
-        # Initial toggle based on loaded engine type
-        self.toggle_engine_settings()
-
-        # Center the settings window initially (optional)
-        self.settings_window.update_idletasks() # Update geometry info
-        # Don't force position if allowing auto-size
-        # x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (self.settings_window.winfo_width() // 2)
-        # y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (self.settings_window.winfo_height() // 2)
-        # self.settings_window.geometry(f"+{x}+{y}")
-
-        # Make window appear after setup
-        self.settings_window.deiconify()
-
-    def toggle_engine_settings(self):
-        """Enable/disable engine-specific settings based on selection."""
-        engine = self.engine_type_var.get()
-
-        # Define widget groups (ensure widgets exist before adding)
-        vosk_widgets = []
-        if hasattr(self, 'vosk_download_button'): vosk_widgets.append(self.vosk_download_button)
-        if hasattr(self, 'vosk_custom_rb'): vosk_widgets.append(self.vosk_custom_rb)
-        if hasattr(self, 'vosk_custom_model_entry'): vosk_widgets.append(self.vosk_custom_model_entry)
-        if hasattr(self, 'vosk_custom_model_browse'): vosk_widgets.append(self.vosk_custom_model_browse)
-        # Find Vosk model radio buttons and label
-        if self.settings_window and self.settings_window.winfo_exists():
-             for widget in self.settings_window.winfo_children():
-                  if isinstance(widget, ttk.LabelFrame) and "Vosk Model Selection" in widget.cget("text"):
-                       for child in widget.winfo_children():
-                            if isinstance(child, ttk.Radiobutton) and child is not getattr(self, 'vosk_custom_rb', None):
-                                 vosk_widgets.append(child)
-                            elif isinstance(child, ttk.Label) and "Preferred Model" in child.cget("text"):
-                                 vosk_widgets.append(child)
-
-        whisper_widgets = []
-        if hasattr(self, 'whisper_rb_list'): whisper_widgets.extend(self.whisper_rb_list)
-        # Find Whisper labels
-        if self.settings_window and self.settings_window.winfo_exists():
-             for widget in self.settings_window.winfo_children():
-                  if isinstance(widget, ttk.LabelFrame) and "Whisper Settings" in widget.cget("text"):
-                       for child in widget.winfo_children():
-                            if isinstance(child, ttk.Label):
-                                 whisper_widgets.append(child)
-
-
-        google_widgets = []
-        if hasattr(self, 'google_creds_entry'): google_widgets.append(self.google_creds_entry)
-        if hasattr(self, 'google_creds_browse'): google_widgets.append(self.google_creds_browse)
-        # Find Google Cloud label
-        if self.settings_window and self.settings_window.winfo_exists():
-             for widget in self.settings_window.winfo_children():
-                  if isinstance(widget, ttk.LabelFrame) and "Google Cloud Settings" in widget.cget("text"):
-                       for child in widget.winfo_children():
-                            if isinstance(child, ttk.Label):
-                                 google_widgets.append(child)
-
-        # Enable/Disable based on selected engine
-        for w in vosk_widgets: w.config(state=tk.NORMAL if engine == 'vosk' else tk.DISABLED)
-        for w in whisper_widgets: w.config(state=tk.NORMAL if engine == 'whisper' else tk.DISABLED)
-        for w in google_widgets: w.config(state=tk.NORMAL if engine == 'google_cloud' else tk.DISABLED)
-
-
-    def apply_theme_to_window(self, window, mode):
-        """Applies theme colors specifically to a given window and its ttk children."""
-        theme = DARK_THEME if mode == 'dark' else LIGHT_THEME
-        bg_col = theme['bg']
-        # fg_col = theme['fg'] # Not needed directly here if styles are used
-
-        window.config(bg=bg_col)
-
-        # Apply styles to all ttk widgets within the window
-        # No need to reconfigure styles here, just apply them to widgets
-        for widget in window.winfo_children():
-            self.update_widget_style(widget) # Use recursive helper
-
-    def update_widget_style(self, widget):
-         """Recursively apply styles to widgets based on current theme."""
-         # Determine current theme mode
-         current_theme_mode = config.get('Settings', 'theme', fallback='light')
-         theme = DARK_THEME if current_theme_mode == 'dark' else LIGHT_THEME
-         bg_col = theme['bg']
-         fg_col = theme['fg']
-
-         widget_class = widget.winfo_class()
-         # Map Tkinter class names to ttk style names (approximate)
-         style_map = {
-             'Frame': 'TFrame', 'LabelFrame': 'TLabelFrame', 'Label': 'TLabel',
-             'Button': 'TButton', 'Entry': 'TEntry', 'Checkbutton': 'TCheckbutton',
-             'Radiobutton': 'TRadiobutton', 'Combobox': 'TCombobox'
-         }
-         # Add specific styles if defined
-         # Check existence of controls_frame before accessing children
-         controls_frame_children = []
-         # Check if self has controls_frame AND if it's not None (safer)
-         if hasattr(self, 'controls_frame') and self.controls_frame:
-             # Check if widget is a child of controls_frame
-             if widget in self.controls_frame.winfo_children():
-                 if isinstance(widget, ttk.Label): style_name = "Controls.TLabel"
-                 elif isinstance(widget, ttk.Button): style_name = "Controls.TButton"
-                 else: style_name = style_map.get(widget_class)
-             elif hasattr(self, 'status_bar') and widget is self.status_bar: # Check status bar specifically
-                 style_name = "Status.TLabel"
-             else:
-                 style_name = style_map.get(widget_class)
-         elif hasattr(self, 'status_bar') and widget is self.status_bar: # Check status bar if controls_frame doesn't exist yet
-              style_name = "Status.TLabel"
-         else:
-             style_name = style_map.get(widget_class)
-
-
-         if style_name:
-             try:
-                 widget.config(style=style_name)
-                 # Explicitly set background for frames/labelframes for better consistency
-                 if widget_class in ['Frame', 'LabelFrame']:
-                      widget.config(style=style_name) # Re-apply style might be needed
-             except tk.TclError: # Widget might not be a ttk widget despite class name
-                 try:
-                     # Fallback for standard tk widgets if needed
-                     widget.config(bg=bg_col, fg=fg_col)
-                 except tk.TclError:
-                     pass # Widget doesn't support bg/fg
-         else:
-             # Apply theme to non-ttk widgets if possible
-             try:
-                 # Special handling for ScrolledText background/foreground
-                 if isinstance(widget, scrolledtext.ScrolledText):
-                      widget.config(bg=theme['text_bg'], fg=theme['text_fg'], insertbackground=fg_col)
-                 else:
-                      widget.config(bg=bg_col, fg=fg_col)
-             except tk.TclError:
-                 pass # Widget doesn't support bg/fg
-
-
-         # Recurse into child widgets
-         for child in widget.winfo_children():
-             self.update_widget_style(child)
-
-
-    def download_and_set_preferred(self):
-        """Handles downloading the selected Vosk model and updating config."""
-        selected_type = self.preferred_vosk_model_type_var.get() # Use correct var
-        if selected_type == 'custom' or selected_type not in MODEL_INFO:
-             messagebox.showwarning("Select Model", f"Please select a standard Vosk model ({', '.join(MODEL_INFO.keys())}) before downloading.", parent=self.settings_window)
-             return
-
-        model_details = MODEL_INFO[selected_type]
-        expected_dir_name = model_details['extracted_dir_name']
-        base_app_path = get_base_path()
-        model_dir_abs = os.path.join(base_app_path, config.get('Models', 'model_directory', fallback=MODEL_BASE_DIR))
-        expected_path = os.path.join(model_dir_abs, expected_dir_name)
-
-        # Check if it already exists
-        if os.path.exists(expected_path):
-             if messagebox.askyesno("Model Exists", f"The '{selected_type}' model seems to already exist.\nDo you want to set it as preferred anyway (without re-downloading)?", parent=self.settings_window):
-                  # Set as preferred without downloading
-                  config.set('Models', 'preferred_vosk_model_type', selected_type)
-                  config.set('Paths', 'custom_model_path', '') # Clear custom path when selecting standard
-                  config.set('Engine', 'type', 'vosk') # Ensure engine is Vosk
-                  self.engine_type_var.set('vosk') # Update GUI variable
-                  if save_config():
-                       messagebox.showinfo("Settings Updated", f"'{selected_type}' Vosk model set as preferred.", parent=self.settings_window)
-                  self.toggle_engine_settings() # Update GUI state
-             return # Exit function whether user clicked yes or no
-
-        # If model doesn't exist, proceed with download
-        # Disable settings window during download? Maybe just show progress.
-        if download_and_extract_model(selected_type, settings_window=self.settings_window):
-            # Download successful, now update config
-            config.set('Models', 'preferred_vosk_model_type', selected_type)
-            config.set('Paths', 'custom_model_path', '') # Clear custom path
-            config.set('Engine', 'type', 'vosk') # Ensure engine is Vosk
-            self.engine_type_var.set('vosk') # Update GUI variable
-            if save_config():
-                 messagebox.showinfo("Download Complete", f"'{selected_type}' model downloaded and set as preferred.", parent=self.settings_window)
-            self.toggle_engine_settings() # Update GUI state
-            # Optionally close settings window after successful download + save?
-            # self.settings_window.destroy()
-        else:
-            # Error message shown by download_and_extract_model
-            pass # Keep settings window open
-
-    def browse_custom_model_path(self):
-        """Opens a directory selection dialog for the model path."""
-        directory = filedialog.askdirectory(title="Select Custom Vosk Model Folder", parent=self.settings_window) # Set parent
-        if directory: # Only update if a directory was selected
-            self.custom_model_path_var.set(directory)
-            # Automatically select the 'custom' radiobutton when a path is chosen
-            self.preferred_vosk_model_type_var.set("custom")
-            # Also set engine type to Vosk if selecting a custom Vosk model path
-            self.engine_type_var.set("vosk")
-            self.toggle_engine_settings()
-
-
-    def browse_log_path(self):
-        """Opens a file save dialog for the log file path."""
-        # Suggest current filename and directory
-        initial_dir = os.path.dirname(self.log_file_path_var.get())
-        initial_file = os.path.basename(self.log_file_path_var.get())
-        # Use get_base_path() to default initialdir if current path is invalid
-        if not initial_dir or not os.path.isdir(initial_dir):
-             initial_dir = get_base_path()
-
-        filepath = filedialog.asksaveasfilename(
-            title="Select Log File Path",
-            initialdir=initial_dir,
-            initialfile=initial_file if initial_file else "live_transcription.log",
-            defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")],
-            parent=self.settings_window # Set parent
-        )
-        if filepath: # Only update if a path was selected/entered
-            self.log_file_path_var.set(filepath)
-
-    def browse_google_creds(self):
-        """Opens a file open dialog for the Google Cloud credentials JSON file."""
-        filepath = filedialog.askopenfilename(
-            title="Select Google Cloud Credentials JSON File",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            parent=self.settings_window
-        )
-        if filepath:
-            self.google_creds_var.set(filepath)
-            # Automatically select Google Cloud engine when creds are chosen
-            self.engine_type_var.set("google_cloud")
-            self.toggle_engine_settings()
-
-
-    def save_settings_and_close(self):
-        """Saves the settings from the dialog to config object and file, then closes."""
-        global config
-        try:
-            # Get values from GUI variables
-            engine_type = self.engine_type_var.get()
-            google_creds_path = self.google_creds_var.get()
-            preferred_vosk_type = self.preferred_vosk_model_type_var.get()
-            custom_model_path = self.custom_model_path_var.get()
-            whisper_model_size = self.whisper_model_size_var.get() # Get Whisper size
-            log_file_path = self.log_file_path_var.get()
-            enable_logging = self.enable_logging_var.get()
-            selected_theme = self.theme_var.get() # Get selected theme
-            # Get current audio source selection to save it (though it's also saved on change)
-            # audio_source_name = self.device_var.get() # From main window
-
-            # --- Validation ---
-            if not log_file_path:
-                 messagebox.showwarning("Validation Error", "Log file path cannot be empty.", parent=self.settings_window)
-                 return
-            if engine_type == 'vosk':
-                if preferred_vosk_type == 'custom' and not custom_model_path:
-                     messagebox.showwarning("Validation Error", "Please specify a path if 'Use Custom Model Path' is selected for Vosk, or choose a standard model.", parent=self.settings_window)
-                     return
-            elif engine_type == 'google_cloud':
-                 if not google_creds_path:
-                      messagebox.showwarning("Validation Error", "Please specify the path to your Google Cloud credentials JSON file.", parent=self.settings_window)
-                      return
-                 # Check existence only if path is not empty
-                 if google_creds_path and not os.path.exists(google_creds_path):
-                      messagebox.showwarning("Validation Error", f"Google Cloud credentials file not found at:\n{google_creds_path}", parent=self.settings_window)
-                      return
-            elif engine_type == 'whisper':
-                 if whisper_model_size not in WHISPER_MODEL_SIZES:
-                      messagebox.showwarning("Validation Error", f"Invalid Whisper model size selected: {whisper_model_size}", parent=self.settings_window)
-                      return
-            else: # Should not happen
-                 messagebox.showerror("Validation Error", f"Invalid engine type selected: {engine_type}", parent=self.settings_window)
-                 return
-
-            # --- Update Config Object ---
-            # Ensure sections exist before setting
-            for section in ['Paths', 'Audio', 'Settings', 'Models', 'Engine', 'Whisper']: # Added Whisper section
-                 if not config.has_section(section): config.add_section(section)
-
-            config.set('Engine', 'type', engine_type)
-            config.set('Engine', 'google_cloud_credentials_json', google_creds_path if engine_type == 'google_cloud' else '')
-
-            config.set('Models', 'preferred_vosk_model_type', preferred_vosk_type if engine_type == 'vosk' else config.get('Models', 'preferred_vosk_model_type', fallback=DEFAULT_VOSK_MODEL_TYPE)) # Only save if relevant
-            config.set('Paths', 'custom_model_path', custom_model_path if engine_type == 'vosk' and preferred_vosk_type == 'custom' else '') # Store custom path only if selected AND engine is Vosk
-
-            config.set('Whisper', 'model_size', whisper_model_size if engine_type == 'whisper' else config.get('Whisper', 'model_size', fallback=DEFAULT_WHISPER_SIZE)) # Save Whisper size
-
-            config.set('Audio', 'log_file', log_file_path)
-            # Config value for audio source is updated by on_device_change callback now
-            # config.set('Audio', 'audio_source_name', audio_source_name)
-
-            config.set('Settings', 'enable_logging', str(enable_logging))
-            config.set('Settings', 'theme', selected_theme) # Save theme setting
-
-            # --- Save Config File ---
-            if save_config():
-                self.status_var.set("System Status: Settings saved successfully.")
-                # Apply the theme immediately to the main window
-                self.apply_theme(selected_theme)
-                self.settings_window.destroy() # Close window on successful save
-            else:
-                # Error message shown by save_config
-                self.status_var.set("System Status: Failed to save settings.")
-
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save settings:\n{e}", parent=self.settings_window)
-            self.status_var.set("System Status: Error saving settings.")
-
-
-# --- Main Execution Block ---
-if __name__ == "__main__":
-    # Load configuration parameters at startup
-    config_ok = load_config()
-    # Configuration issues are now treated as warnings; proceed to dependency check
-
-    # --- Dependency Check Block ---
-    # This block is intended for running the .py script directly.
-    # It should be COMMENTED OUT before using PyInstaller to bundle the application.
-    # if not install_dependencies():
-    #     print("\nSystem HALT: Critical dependency or pip error prevents execution.")
-    #     try:
-    #         tk_spec = importlib.util.find_spec("tkinter")
-    #         if tk_spec:
-    #             import tkinter as tk
-    #             from tkinter import messagebox
-    #             root = tk.Tk()
-    #             root.withdraw()
-    #             messagebox.showerror("Initialization Error", "Failed to initialize required libraries or pip.\nConsult console log for details and required actions.")
-    #             root.destroy()
-    #         else:
-    #              print("(Underlying Tkinter subsystem unavailable for GUI error message)")
-    #     except Exception as e:
-    #         print(f"(Exception during Tkinter error reporting: {e})")
-    #     sys.exit(1)
-    # --- End of Dependency Check Block ---
-
-
-    # Initialize the Tkinter GUI framework
+        config.set("Engine", "type", engine)
+        config.set("Engine", "google_cloud_credentials_json", self.creds_var.get().strip())
+        config.set("Models", "preferred_vosk_model_type", self.vosk_model_var.get())
+        config.set("Paths", "custom_model_path", self.custom_path_var.get().strip())
+        config.set("Whisper", "backend", self.backend_var.get())
+        config.set("Whisper", "model_size", self.size_var.get().strip() or DEFAULT_WHISPER_SIZE)
+        config.set("Whisper", "device", self.device_var.get())
+        config.set("Whisper", "compute_type", self.compute_var.get())
+        config.set("Whisper", "language", self.language_var.get().strip() or "auto")
+        config.set("Whisper", "vad_filter", str(bool(self.vad_var.get())))
+        config.set("Sherpa", "model", self.sherpa_model_var.get())
+        config.set("Sherpa", "custom_model_dir", self.sherpa_custom_var.get().strip())
+        config.set("Moonshine", "model", self.moonshine_var.get())
+        config.set("GoogleWeb", "language", self.gweb_lang_var.get().strip() or "en-US")
+        config.set("Speakers", "enabled", str(bool(self.spk_enabled_var.get())))
+        config.set("Speakers", "similarity_threshold", f"{max(0.2, min(0.9, spk_threshold)):.2f}")
+        config.set("Speakers", "max_speakers", str(max(2, min(16, spk_max))))
+        config.set("Audio", "pause_threshold", f"{max(0.2, min(5.0, pause)):.2f}")
+        config.set("Audio", "max_phrase_sec", f"{max(3.0, min(60.0, maxphrase)):.1f}")
+        config.set("Audio", "energy_threshold", energy or "auto")
+        config.set("Settings", "enable_logging", str(bool(self.logging_var.get())))
+        config.set("Audio", "log_file", self.logpath_var.get().strip() or "live_transcription.log")
+        config.set("Settings", "overlay_opacity", f"{self.overlay_opacity_var.get():.0f}")
+
+        save_config()
+        self.app.set_font_size(max(8, min(24, fontsize)))
+        if engine in ENGINE_LABELS and engine in available_engines():
+            self.app.engine_var.set(ENGINE_LABELS[engine])
+        self.app.status_var.set("Settings saved.")
+        self.destroy()
+
+
+# --- Main ------------------------------------------------------------------------
+def main():
+    load_config()
+    # Goes to app_errors.log in frozen builds - first thing to check when
+    # someone reports a missing engine.
+    print(f"{APP_TITLE} starting ({datetime.now():%Y-%m-%d %H:%M:%S}) - "
+          f"engines available: {', '.join(available_engines()) or 'NONE'}")
     root = tk.Tk()
-    # Define app globally so save_config and download function can use it as fallback parent
-    app = TranscriberApp(root) # Instantiate the main application class
-    # Display configuration warning in status bar if needed
-    if not config_ok:
-         app.status_var.set("Warning: Default config created. Check Settings.")
-    else:
-        # Check initial model configuration status after loading config
-        engine_type = config.get('Engine', 'type', fallback='vosk')
-        if engine_type == 'vosk':
-            preferred_type = config.get('Models', 'preferred_vosk_model_type', fallback=DEFAULT_VOSK_MODEL_TYPE)
-            custom_path = config.get('Paths', 'custom_model_path', fallback='')
-            if preferred_type == 'custom' and not custom_path:
-                app.status_var.set("Warning: Vosk 'Custom Model' selected but no path set. Use Settings.")
-            elif preferred_type == 'custom':
-                 # Resolve relative path for check
-                 if not os.path.isabs(custom_path): custom_path = os.path.join(get_base_path(), custom_path)
-                 if not os.path.exists(custom_path):
-                     app.status_var.set(f"Warning: Vosk custom model path not found. Check Settings.")
-            elif preferred_type in MODEL_INFO:
-                 model_details = MODEL_INFO[preferred_type]
-                 model_dir_abs = os.path.join(get_base_path(), config.get('Models', 'model_directory', fallback=MODEL_BASE_DIR))
-                 expected_path = os.path.join(model_dir_abs, model_details['extracted_dir_name'])
-                 if not os.path.exists(expected_path):
-                      app.status_var.set(f"Warning: Preferred Vosk model '{preferred_type}' not downloaded. Use Settings.")
-        elif engine_type == 'google_cloud':
-             google_creds = config.get('Engine', 'google_cloud_credentials_json', fallback='')
-             if not google_creds:
-                  app.status_var.set("Warning: Google Cloud selected but no credentials set. Use Settings.")
-             else:
-                  # Resolve relative path for check
-                  if not os.path.isabs(google_creds): google_creds = os.path.join(get_base_path(), google_creds)
-                  if not os.path.exists(google_creds):
-                       app.status_var.set("Warning: Google Cloud credentials file not found. Check Settings.")
-        elif engine_type == 'whisper':
-             whisper_size = config.get('Whisper', 'model_size', fallback=DEFAULT_WHISPER_SIZE)
-             # Could add a check here if Whisper model file exists in cache, but SR handles download
-             # MODIFICATION: Updated status message slightly
-             app.status_var.set(f"Whisper engine selected ({whisper_size}). Model downloads on first use.")
-
-        # Check if selected audio source still exists
-        selected_source = config.get('Audio', 'audio_source_name', fallback='')
-        if selected_source and selected_source not in app.devices.keys():
-             app.status_var.set(f"Warning: Saved audio source '{selected_source}' not found. Select a valid source.")
-        elif not selected_source and app.devices:
-             app.status_var.set(f"Audio source set to default: {app.device_var.get()}.")
-
-
-    # Start the Tkinter event loop (makes the window interactive)
+    app = TranscriberApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
